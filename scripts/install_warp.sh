@@ -74,12 +74,18 @@ EOF
 systemctl daemon-reload
 systemctl enable --now warp-proxy-autoconnect.service
 
-# 安装管理命令
+# 安装管理命令并建立全局软链接
+REPO_URL="https://raw.githubusercontent.com/weiweibunan/xray-xhttp-warp/main"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 if [ -f "${SCRIPT_DIR}/warp_ctl.sh" ]; then
     cp -f "${SCRIPT_DIR}/warp_ctl.sh" /usr/local/bin/warp
-    chmod +x /usr/local/bin/warp
+elif [ -f "${SCRIPT_DIR}/scripts/warp_ctl.sh" ]; then
+    cp -f "${SCRIPT_DIR}/scripts/warp_ctl.sh" /usr/local/bin/warp
+else
+    curl -sSL "${REPO_URL}/scripts/warp_ctl.sh" -o /usr/local/bin/warp
 fi
+chmod +x /usr/local/bin/warp
+ln -sf /usr/local/bin/warp /usr/bin/warp
 
 echo -e "${GREEN}>>> [WARP 5/5] 验证 SOCKS5 (127.0.0.1:40000) 连通性...${PLAIN}"
 sleep 3

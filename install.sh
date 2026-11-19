@@ -32,14 +32,28 @@ get_subscript() {
     fi
 }
 
+ensure_ctl() {
+    if [ ! -s /usr/local/bin/xm ]; then
+        curl -sSL "${REPO_URL}/scripts/xm_ctl.sh" -o /usr/local/bin/xm 2>/dev/null && chmod +x /usr/local/bin/xm || true
+    fi
+    ln -sf /usr/local/bin/xm /usr/bin/xm 2>/dev/null || true
+
+    if [ ! -s /usr/local/bin/warp ]; then
+        curl -sSL "${REPO_URL}/scripts/warp_ctl.sh" -o /usr/local/bin/warp 2>/dev/null && chmod +x /usr/local/bin/warp || true
+    fi
+    ln -sf /usr/local/bin/warp /usr/bin/warp 2>/dev/null || true
+}
+
 install_warp_only() {
     local script=$(get_subscript "install_warp.sh")
     bash "$script"
+    ensure_ctl
 }
 
 install_xray_only() {
     local script=$(get_subscript "install_xray.sh")
     bash "$script"
+    ensure_ctl
 }
 
 enable_bbr() {

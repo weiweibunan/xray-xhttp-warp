@@ -269,12 +269,18 @@ elif command -v firewall-cmd >/dev/null 2>&1; then
     firewall-cmd --reload >/dev/null 2>&1 || true
 fi
 
-# 安装 xm 管理命令
+# 安装 xm 管理命令并建立全局软链接
+REPO_URL="https://raw.githubusercontent.com/weiweibunan/xray-xhttp-warp/main"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 if [ -f "${SCRIPT_DIR}/xm_ctl.sh" ]; then
     cp -f "${SCRIPT_DIR}/xm_ctl.sh" /usr/local/bin/xm
-    chmod +x /usr/local/bin/xm
+elif [ -f "${SCRIPT_DIR}/scripts/xm_ctl.sh" ]; then
+    cp -f "${SCRIPT_DIR}/scripts/xm_ctl.sh" /usr/local/bin/xm
+else
+    curl -sSL "${REPO_URL}/scripts/xm_ctl.sh" -o /usr/local/bin/xm
 fi
+chmod +x /usr/local/bin/xm
+ln -sf /usr/local/bin/xm /usr/bin/xm
 
 # 打印节点信息
 if [ -x /usr/local/bin/xm ]; then
