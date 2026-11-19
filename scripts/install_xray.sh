@@ -82,7 +82,7 @@ echo -e "${GREEN}>>> [XRAY 4/5] 写入生产级 /etc/xray/config.json 配置文�
 cat > $CONFIG << JSON
 {
   "log": {
-    "loglevel": "warning"
+    "loglevel": "error"
   },
   "dns": {
     "servers": [
