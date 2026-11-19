@@ -1,0 +1,152 @@
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "dns": {
+    "servers": [
+      "https+local://1.1.1.1/dns-query",
+      "https+local://8.8.8.8/dns-query",
+      "2606:4700:4700::1111",
+      "2001:4860:4860::8888",
+      "localhost"
+    ],
+    "queryStrategy": "UseIPv6"
+  },
+  "inbounds": [
+    {
+      "tag": "xhttp-h3-in",
+      "listen": "::",
+      "port": 8443,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "YOUR_UUID_HERE",
+            "flow": ""
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "security": "tls",
+        "xhttpSettings": {
+          "mode": "auto",
+          "path": "/YOUR_UUID_HERE-xu"
+        },
+        "tlsSettings": {
+          "alpn": [
+            "h3"
+          ],
+          "certificates": [
+            {
+              "certificateFile": "/root/ygkkkca/cert.crt",
+              "keyFile": "/root/ygkkkca/private.key"
+            }
+          ]
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"],
+        "metadataOnly": false
+      }
+    },
+    {
+      "tag": "xhttp-cdn-443-in",
+      "listen": "::",
+      "port": 443,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "YOUR_UUID_HERE",
+            "flow": ""
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "security": "tls",
+        "sockopt": {
+          "trustedXForwardedFor": [
+            "CF-Connecting-IP"
+          ]
+        },
+        "xhttpSettings": {
+          "mode": "auto",
+          "path": "/YOUR_UUID_HERE-xc"
+        },
+        "tlsSettings": {
+          "alpn": [
+            "h2",
+            "http/1.1"
+          ],
+          "certificates": [
+            {
+              "certificateFile": "/root/ygkkkca/cert.crt",
+              "keyFile": "/root/ygkkkca/private.key"
+            }
+          ]
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"],
+        "metadataOnly": false
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom"
+    },
+    {
+      "tag": "warp-ipv6-out",
+      "protocol": "freedom",
+      "streamSettings": {
+        "sockopt": {
+          "domainStrategy": "UseIPv6",
+          "dialerProxy": "socks-warp"
+        }
+      }
+    },
+    {
+      "tag": "socks-warp",
+      "protocol": "socks",
+      "settings": {
+        "servers": [
+          {
+            "address": "127.0.0.1",
+            "port": 40000
+          }
+        ]
+      }
+    },
+    {
+      "tag": "block",
+      "protocol": "blackhole"
+    }
+  ],
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": [
+      {
+        "type": "field",
+        "outboundTag": "warp-ipv6-out",
+        "domain": [
+          "geosite:openai",
+          "geosite:google-gemini",
+          "geosite:google-deepmind"
+        ]
+      },
+      {
+        "type": "field",
+        "outboundTag": "direct",
+        "network": "tcp,udp"
+      }
+    ]
+  }
+}

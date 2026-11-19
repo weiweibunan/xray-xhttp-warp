@@ -1,0 +1,15 @@
+[Unit]
+Description=Cloudflare WARP Proxy Auto Connect
+After=network-online.target warp-svc.service
+Wants=network-online.target
+Requires=warp-svc.service
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 3
+ExecStart=/usr/bin/warp-cli --accept-tos connect
+ExecStop=/usr/bin/warp-cli --accept-tos disconnect
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

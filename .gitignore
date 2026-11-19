@@ -1,0 +1,12 @@
+# Logs
+*.log
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Temporary and local certs
+*.pem
+*.key
+*.crt
+cert/
