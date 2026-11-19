@@ -172,17 +172,23 @@ enable_bbr() {
         return 1
     fi
 
-    sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
-    echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf
-    echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf
-    sysctl -p >/dev/null 2>&1
+    # 遵循现代系统规范：使用 /etc/sysctl.d/99-bbr.conf 独立配置文件
+    mkdir -p /etc/sysctl.d
+    cat > /etc/sysctl.d/99-bbr.conf << 'BBRCONF'
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+BBRCONF
+
+    # 清理旧版 /etc/sysctl.conf 历史遗留并重载系统配置
+    sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf 2>/dev/null || true
+    sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf 2>/dev/null || true
+    sysctl --system >/dev/null 2>&1 || sysctl -p /etc/sysctl.d/99-bbr.conf >/dev/null 2>&1
 
     NEW_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
     if [ "$NEW_CC" = "bbr" ]; then
         echo -e "${GREEN}🎉 成功开启 TCP BBR 加速！当前算法：${NEW_CC}${PLAIN}"
     else
-        echo -e "${YELLOW}⚠️ 已写入配置，如未立即生效，建议重启服务器 (reboot)。${PLAIN}"
+        echo -e "${YELLOW}⚠️ 已写入 /etc/sysctl.d/99-bbr.conf，如未立即生效，建议重启服务器 (reboot)。${PLAIN}"
     fi
 }
 
