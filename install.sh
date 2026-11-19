@@ -42,21 +42,49 @@ install_xray_only() {
     bash "$script"
 }
 
+enable_bbr() {
+    echo -e "\n${CYAN}>>> 检查并开启系统 TCP BBR 加速...${PLAIN}"
+    CURRENT_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
+    if [ "$CURRENT_CC" = "bbr" ]; then
+        echo -e "${GREEN}✅ 系统已启用 BBR 加速！当前算法：${CURRENT_CC}${PLAIN}"
+        return 0
+    fi
+
+    sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
+    echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf
+    echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf
+    sysctl -p >/dev/null 2>&1
+
+    NEW_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
+    if [ "$NEW_CC" = "bbr" ]; then
+        echo -e "${GREEN}🎉 成功开启 TCP BBR 加速！当前算法：${NEW_CC}${PLAIN}"
+    else
+        echo -e "${YELLOW}⚠️ 已写入配置，如未立即生效，建议重启服务器 (reboot)。${PLAIN}"
+    fi
+}
+
 install_all() {
     echo -e "\n${BLUE}==================================================${PLAIN}"
-    echo -e "${GREEN}>>> 步骤一：部署 Cloudflare 官方 WARP SOCKS5 (40000)...${PLAIN}"
+    echo -e "${GREEN}>>> 步骤一：开启/检查系统 TCP BBR 加速...${PLAIN}"
+    echo -e "${BLUE}==================================================${PLAIN}"
+    enable_bbr
+
+    echo -e "\n${BLUE}==================================================${PLAIN}"
+    echo -e "${GREEN}>>> 步骤二：部署 Cloudflare 官方 WARP SOCKS5 (40000)...${PLAIN}"
     echo -e "${BLUE}==================================================${PLAIN}"
     install_warp_only
 
     echo -e "\n${BLUE}==================================================${PLAIN}"
-    echo -e "${GREEN}>>> 步骤二：部署 Xray VLESS-XHTTP 与 IPv6 分流网关...${PLAIN}"
+    echo -e "${GREEN}>>> 步骤三：部署 Xray VLESS-XHTTP 与 IPv6 分流网关...${PLAIN}"
     echo -e "${BLUE}==================================================${PLAIN}"
     install_xray_only
 
     echo -e "\n${GREEN}==================================================${PLAIN}"
     echo -e "${GREEN}🎉 全套系统已成功就绪！${PLAIN}"
+    echo -e "  - BBR 加速状态 : $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '未知')"
     echo -e "  - WARP 管理命令: ${CYAN}warp${PLAIN} (测试: warp test)"
-    echo -e "  - Xray 管理命令: ${CYAN}xm${PLAIN}   (节点: xm info)"
+    echo -e "  - Xray 管理命令: ${CYAN}xm${PLAIN}   (节点: xm info | BBR: xm bbr)"
     echo -e "${GREEN}==================================================${PLAIN}"
 }
 
@@ -78,19 +106,21 @@ show_menu() {
     echo -e "${BLUE}==================================================${PLAIN}"
     echo -e "${GREEN}   xray-xhttp-warp 全官方原生网关一键安装程序     ${PLAIN}"
     echo -e "${BLUE}==================================================${PLAIN}"
-    echo -e " ${GREEN}1.${PLAIN} 一键全套安装 (官方 WARP + Xray 双节点 + AI IPv6 分流) [推荐]"
+    echo -e " ${GREEN}1.${PLAIN} 一键全套安装 (开启BBR + 官方WARP + Xray双节点 + AI分流) [推荐]"
     echo -e " ${GREEN}2.${PLAIN} 仅安装 Cloudflare 官方 WARP (SOCKS5 40000 端口)"
     echo -e " ${GREEN}3.${PLAIN} 仅安装 Xray (VLESS-XHTTP + AI 分流网关)"
+    echo -e " ${GREEN}4.${PLAIN} 开启/检查系统 TCP BBR 加速"
     echo -e "--------------------------------------------------"
-    echo -e " ${RED}4.${PLAIN} 彻底卸载清理全套组件"
+    echo -e " ${RED}5.${PLAIN} 彻底卸载清理全套组件"
     echo -e " ${YELLOW}0.${PLAIN} 退出向导"
     echo -e "${BLUE}==================================================${PLAIN}"
-    read -p "请输入选项 [0-4]: " choice
+    read -p "请输入选项 [0-5]: " choice
     case "$choice" in
         1) install_all ;;
         2) install_warp_only ;;
         3) install_xray_only ;;
-        4) uninstall_all ;;
+        4) enable_bbr ;;
+        5) uninstall_all ;;
         0) exit 0 ;;
         *) echo -e "${RED}输入无效！${PLAIN}" ;;
     esac
@@ -100,6 +130,7 @@ case "$1" in
     all) install_all ;;
     warp) install_warp_only ;;
     xray) install_xray_only ;;
+    bbr) enable_bbr ;;
     uninstall) uninstall_all ;;
     *) show_menu ;;
 esac

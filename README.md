@@ -91,6 +91,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/weiweibunan/xray-xhttp-warp/
 | `xm status` | 查看 Xray 实时运行状态 |
 | `xm log` | 实时查看连接与分流日志（按 `Ctrl+C` 退出） |
 | `xm uuid` | 一键重新生成/更换用户 UUID |
+| `xm bbr` | 一键开启/检查系统 TCP BBR 拥塞控制加速 |
 | `xm update-core` | 升级 Xray 官方最新核心 |
 | `xm update-geo` | 更新 `geosite.dat` / `geoip.dat` 规则库 |
 | `xm test` | 校验 `/etc/xray/config.json` 语法正确性 |

@@ -156,6 +156,36 @@ test_config() {
     /usr/local/bin/xray -test -config "$CONFIG"
 }
 
+enable_bbr() {
+    echo -e "${CYAN}>>> 正在检查并开启系统 TCP BBR 加速...${PLAIN}"
+    CURRENT_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
+    if [ "$CURRENT_CC" = "bbr" ]; then
+        echo -e "${GREEN}✅ 系统已启用 BBR 加速！当前算法：${CURRENT_CC}${PLAIN}"
+        return 0
+    fi
+
+    KERNEL_VER=$(uname -r | cut -d- -f1)
+    MAJOR=$(echo "$KERNEL_VER" | cut -d. -f1)
+    MINOR=$(echo "$KERNEL_VER" | cut -d. -f2)
+    if [ "$MAJOR" -lt 4 ] || ([ "$MAJOR" -eq 4 ] && [ "$MINOR" -lt 9 ]); then
+        echo -e "${RED}❌ 当前内核版本 ($KERNEL_VER) 过低，BBR 需要 Linux 4.9 以上内核！${PLAIN}"
+        return 1
+    fi
+
+    sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
+    echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf
+    echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf
+    sysctl -p >/dev/null 2>&1
+
+    NEW_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
+    if [ "$NEW_CC" = "bbr" ]; then
+        echo -e "${GREEN}🎉 成功开启 TCP BBR 加速！当前算法：${NEW_CC}${PLAIN}"
+    else
+        echo -e "${YELLOW}⚠️ 已写入配置，如未立即生效，建议重启服务器 (reboot)。${PLAIN}"
+    fi
+}
+
 uninstall_xray() {
     read -p "⚠️ 确认要彻底卸载 Xray 服务及配置吗？(y/n): " confirm
     if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
@@ -185,11 +215,12 @@ menu() {
     echo -e " ${GREEN}8.${PLAIN} 升级 Xray 官方最新内核 (update-core)"
     echo -e " ${GREEN}9.${PLAIN} 升级 geosite/geoip 规则库 (update-geo)"
     echo -e " ${GREEN}10.${PLAIN} 校验配置文件语法 (test)"
+    echo -e " ${GREEN}11.${PLAIN} 开启/检查系统 BBR 加速 (bbr)"
     echo -e "--------------------------------------------------"
-    echo -e " ${RED}11.${PLAIN} 彻底卸载 Xray (uninstall)"
+    echo -e " ${RED}12.${PLAIN} 彻底卸载 Xray (uninstall)"
     echo -e " ${YELLOW}0.${PLAIN} 退出菜单"
     echo -e "${BLUE}==================================================${PLAIN}"
-    read -p "请输入选项 [0-11]: " choice
+    read -p "请输入选项 [0-12]: " choice
     case "$choice" in
         1) show_info ;;
         2) start_xray ;;
@@ -201,7 +232,8 @@ menu() {
         8) upgrade_core ;;
         9) upgrade_geo ;;
         10) test_config ;;
-        11) uninstall_xray ;;
+        11) enable_bbr ;;
+        12) uninstall_xray ;;
         0) exit 0 ;;
         *) echo -e "${RED}输入无效，请重新输入！${PLAIN}" ;;
     esac
@@ -218,6 +250,7 @@ case "$1" in
     update-core) upgrade_core ;;
     update-geo) upgrade_geo ;;
     test) test_config ;;
+    bbr) enable_bbr ;;
     uninstall|del) uninstall_xray ;;
     *) menu ;;
 esac
