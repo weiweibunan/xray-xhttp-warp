@@ -1,8 +1,8 @@
 #!/bin/bash
 # ==============================================================================
-# Xray VLESS-XHTTP 容器/NAT 穿透模式 (Cloudflare 官方 Tunnel 隧道入栈)
+# Xray VLESS-XHTTP 容器/NAT 穿透模式 (Cloudflare 官方 Tunnel 隧道入栈 + WARP AI 分流)
 # 专为 Docker / PRoot / NAT VPS / 无公网入站端口容器环境设计
-# 仅部署 Cloudflare 优选节点，免证书、免公网端口、防封锁
+# 仅部署 Cloudflare 优选节点，免证书、免公网端口、防封锁，纯用户态 WireGuard WARP 出口分流
 # ==============================================================================
 
 set -e
@@ -27,10 +27,11 @@ is_systemd() {
 }
 
 echo -e "${BLUE}====================================================================${PLAIN}"
-echo -e "${GREEN}    Xray 容器/NAT 穿透模式安装向导 (Cloudflare Tunnel 隧道入栈)     ${PLAIN}"
+echo -e "${GREEN}    Xray 容器/NAT 穿透模式安装向导 (Cloudflare Tunnel + WARP 分流)   ${PLAIN}"
 echo -e "${BLUE}====================================================================${PLAIN}"
 echo -e "${CYAN}说明：此模式利用 Cloudflare 官方隧道从容器内部主动向外建立连接，${PLAIN}"
-echo -e "${CYAN}      无需容器开放任何公网端口，本地无需申请 SSL 证书，完美契合容器！${PLAIN}"
+echo -e "${CYAN}      无需容器开放任何公网端口，本地无需申请 SSL 证书；${PLAIN}"
+echo -e "${CYAN}      同时集成纯用户态 WireGuard WARP 出口，解锁 OpenAI / Gemini AI 分流！${PLAIN}"
 echo -e "${BLUE}--------------------------------------------------------------------${PLAIN}"
 
 # 1. 交互式输入 Cloudflare Tunnel Token
@@ -83,17 +84,18 @@ echo -e "${BLUE}----------------------------------------------------------------
 echo -e "配置确认："
 echo -e "  - 隧道域名 : ${CYAN}${CF_DOMAIN}${PLAIN}"
 echo -e "  - 本地端口 : ${CYAN}127.0.0.1:${LOCAL_PORT}${PLAIN}"
+echo -e "  - AI 分流  : ${GREEN}OpenAI + Gemini -> Cloudflare WARP (WireGuard 原生出站)${PLAIN}"
 echo -e "  - 运行环境 : $(is_systemd && echo "${GREEN}标准系统 (Systemd)${PLAIN}" || echo "${YELLOW}轻量容器/沙箱 (进程自守护)${PLAIN}")"
 echo -e "${BLUE}--------------------------------------------------------------------${PLAIN}"
 
-echo -e "\n${GREEN}>>> [TUNNEL 1/5] 安装必要系统依赖...${PLAIN}"
+echo -e "\n${GREEN}>>> [TUNNEL 1/6] 安装必要系统依赖...${PLAIN}"
 if command -v apt-get >/dev/null 2>&1; then
-    apt-get update -y && apt-get install -y curl unzip procps
+    apt-get update -y && apt-get install -y curl unzip procps ca-certificates
 elif command -v yum >/dev/null 2>&1; then
-    yum install -y curl unzip procps
+    yum install -y curl unzip procps ca-certificates
 fi
 
-echo -e "${GREEN}>>> [TUNNEL 2/5] 下载并安装 Xray 官方内核与规则库...${PLAIN}"
+echo -e "${GREEN}>>> [TUNNEL 2/6] 下载并安装 Xray 官方内核与规则库...${PLAIN}"
 ARCH=$(uname -m)
 case "$ARCH" in
   x86_64|amd64) FILE="Xray-linux-64.zip" ;;
@@ -123,7 +125,7 @@ ensure_dat() {
 ensure_dat geosite.dat
 ensure_dat geoip.dat
 
-echo -e "${GREEN}>>> [TUNNEL 3/5] 下载 Cloudflare 官方 cloudflared 客户端...${PLAIN}"
+echo -e "${GREEN}>>> [TUNNEL 3/6] 下载 Cloudflare 官方 cloudflared 客户端...${PLAIN}"
 CF_BIN="/usr/local/bin/cloudflared"
 case "$ARCH" in
   x86_64|amd64) CF_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64" ;;
@@ -133,7 +135,86 @@ esac
 curl -sSL "$CF_URL" -o "$CF_BIN"
 chmod +x "$CF_BIN"
 
-echo -e "${GREEN}>>> [TUNNEL 4/5] 写入隧道专属 Xray 配置与环境变量...${PLAIN}"
+echo -e "${GREEN}>>> [TUNNEL 4/6] 配置 Cloudflare WARP 原生 WireGuard 出口分流...${PLAIN}"
+WARP_DIR="/var/lib/cloudflare-warp"
+mkdir -p "$WARP_DIR"
+
+if ! command -v warp-cli >/dev/null 2>&1; then
+    echo -e "${CYAN}安装官方 Cloudflare WARP 客户端用于安全获取原生密钥...${PLAIN}"
+    if command -v apt-get >/dev/null 2>&1; then
+        mkdir -p /usr/share/keyrings
+        curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg 2>/dev/null || true
+        . /etc/os-release 2>/dev/null || true
+        CODENAME="${VERSION_CODENAME:-bookworm}"
+        echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${CODENAME} main" > /etc/apt/sources.list.d/cloudflare-client.list 2>/dev/null || true
+        apt-get update -y && apt-get install -y cloudflare-warp 2>/dev/null || true
+    fi
+fi
+
+NEED_REG=false
+if [ ! -f "${WARP_DIR}/reg.json" ] || [ ! -f "${WARP_DIR}/conf.json" ]; then
+    NEED_REG=true
+elif ! grep -q 'curve25519' "${WARP_DIR}/conf.json" 2>/dev/null; then
+    NEED_REG=true
+fi
+
+if [ "$NEED_REG" = "true" ] && command -v warp-cli >/dev/null 2>&1; then
+    echo -e "${CYAN}向 Cloudflare 官方注册专属 WARP WireGuard 账户...${PLAIN}"
+    pkill -x warp-svc 2>/dev/null || true
+    nohup /usr/bin/warp-svc >/dev/null 2>&1 &
+    sleep 2
+    warp-cli --accept-tos registration new 2>/dev/null || true
+    warp-cli --accept-tos tunnel protocol set WireGuard 2>/dev/null || true
+    sleep 1
+    pkill -x warp-svc 2>/dev/null || true
+fi
+
+WARP_SECRET_KEY=$(grep -o '"secret_key":"[^"]*' "${WARP_DIR}/reg.json" 2>/dev/null | cut -d'"' -f4 || true)
+WARP_IPV4=$(grep -o '"v4":"[^"]*' "${WARP_DIR}/conf.json" 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
+WARP_IPV6=$(grep -o '"v6":"[^"]*' "${WARP_DIR}/conf.json" 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
+[ -z "$WARP_IPV4" ] && WARP_IPV4="172.16.0.2"
+[ -z "$WARP_IPV6" ] && WARP_IPV6="2606:4700:110:81ec:2cd0:332c:af20:33e5"
+WARP_ENDPOINT="162.159.192.1:2408"
+WARP_PUBKEY="bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
+
+if [ -n "$WARP_SECRET_KEY" ]; then
+    echo -e "${GREEN}✅ Cloudflare WARP WireGuard 凭据就绪！${PLAIN}"
+    WARP_OUTBOUND_JSON='{
+      "tag": "warp-out",
+      "protocol": "wireguard",
+      "settings": {
+        "secretKey": "'"${WARP_SECRET_KEY}"'",
+        "address": [
+          "'"${WARP_IPV4}"'/32",
+          "'"${WARP_IPV6}"'/128"
+        ],
+        "peers": [
+          {
+            "publicKey": "'"${WARP_PUBKEY}"'",
+            "endpoint": "'"${WARP_ENDPOINT}"'"
+          }
+        ],
+        "mtu": 1280
+      }
+    },'
+    WARP_ROUTING_RULE='{
+        "type": "field",
+        "outboundTag": "warp-out",
+        "domain": [
+          "geosite:openai",
+          "geosite:google-gemini",
+          "geosite:google-deepmind"
+        ]
+      },'
+    WARP_ENABLED_FLAG="1"
+else
+    echo -e "${YELLOW}⚠️ 未能获取到 WARP 密钥，默认退化为直连出站。${PLAIN}"
+    WARP_OUTBOUND_JSON=""
+    WARP_ROUTING_RULE=""
+    WARP_ENABLED_FLAG="0"
+fi
+
+echo -e "${GREEN}>>> [TUNNEL 5/6] 写入隧道入栈与分流 Xray 配置...${PLAIN}"
 UUID=$(grep -oE '"id": "[0-9a-fA-F-]{36}"' $CONFIG 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
 [ -z "$UUID" ] && UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || tr -dc 'a-f0-9' < /dev/urandom | head -c 32 | sed -E 's/(.{8})(.{4})(.{4})(.{4})(.{12})/\1-\2-\3-\4-\5/')
 
@@ -186,6 +267,7 @@ cat > "$CONFIG" << JSON
       "tag": "direct",
       "protocol": "freedom"
     },
+    ${WARP_OUTBOUND_JSON}
     {
       "tag": "block",
       "protocol": "blackhole"
@@ -194,6 +276,7 @@ cat > "$CONFIG" << JSON
   "routing": {
     "domainStrategy": "AsIs",
     "rules": [
+      ${WARP_ROUTING_RULE}
       {
         "type": "field",
         "outboundTag": "direct",
@@ -204,18 +287,19 @@ cat > "$CONFIG" << JSON
 }
 JSON
 
-# 保存隧道元数据供 xm 管理命令读取
+# 保存隧道与 WARP 元数据供 xm 管理命令读取
 cat > "$TUNNEL_CONF" << EOF
 CF_TUNNEL_TOKEN="${CF_TOKEN}"
 CF_TUNNEL_DOMAIN="${CF_DOMAIN}"
 CF_LOCAL_PORT="${LOCAL_PORT}"
 TUNNEL_MODE="1"
+WARP_ENABLED="${WARP_ENABLED_FLAG}"
 EOF
 chmod 600 "$TUNNEL_CONF"
 
 /usr/local/bin/xray -test -config "$CONFIG"
 
-echo -e "${GREEN}>>> [TUNNEL 5/5] 启动并守护服务 (自动适配环境)...${PLAIN}"
+echo -e "${GREEN}>>> [TUNNEL 6/6] 启动并守护服务 (自动适配环境)...${PLAIN}"
 if is_systemd; then
     echo -e "${CYAN}检测到 Systemd，正在配置守护服务...${PLAIN}"
     cat > /etc/systemd/system/xray.service << SERVICE

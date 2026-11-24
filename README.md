@@ -49,13 +49,16 @@ flowchart TD
     WarpSvc -->|Cloudflare IPv6 出口| TargetAI
 ```
 
-### 2. 容器 / NAT 穿透模式拓扑 (Cloudflare Tunnel)
+### 2. 容器 / NAT 穿透模式拓扑 (Cloudflare Tunnel + WireGuard WARP 分流)
 ```mermaid
-flowchart LR
-    Client(["客户端"]) -->|优选 IP / CDN 443| CFEdge["Cloudflare 边缘网络 (自动 TLS)"]
-    CFEdge -->|官方 Argo 双向隧道| CFTunnel["cloudflared (主动出站连接)"]
-    CFTunnel -->|HTTP 本地回环| XrayLocal["Xray (127.0.0.1:8080)"]
-    XrayLocal -->|出站直连| Internet["全球互联网络"]
+flowchart TD
+    Client(["客户端 (v2rayN / Clash.Meta / Karing)"]) -->|CF 优选 IP:443| CFEdge["Cloudflare Anycast 边缘 (自动 TLS)"]
+    CFEdge -->|Argo 双向隧道| CFTunnel["cloudflared (主动出站连接)"]
+    CFTunnel -->|HTTP 127.0.0.1:8080| Inbound["Xray (xhttp-tunnel-in)"]
+    
+    Inbound --> Router{"Xray 路由分流 (AsIs)"}
+    Router -->|常规流量| OutDirect["freedom (容器直连出站)"] --> TargetDirect["国际互联网络"]
+    Router -->|geosite:openai\ngeosite:google-gemini| OutWarp["WireGuard (用户态纯内存堆栈)"] --> TargetAI["Cloudflare WARP 出口 (OpenAI / Gemini 解锁)"]
 ```
 
 ---

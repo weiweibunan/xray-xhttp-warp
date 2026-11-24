@@ -60,6 +60,7 @@ show_info() {
         echo -e "  运行模式      : ${CYAN}容器/NAT 穿透模式 (Cloudflare Tunnel 隧道入栈)${PLAIN}"
         echo -e "  Xray 服务状态 : $X_STATUS"
         echo -e "  隧道服务状态  : $CF_STATUS"
+        echo -e "  分流出站配置  : ${YELLOW}OpenAI + Gemini + DeepMind -> Cloudflare WARP (WireGuard 原生架构)${PLAIN}"
         echo -e "  隧道绑定域名  : ${CYAN}${DOMAIN}${PLAIN}"
         echo -e "  本地监听端口  : ${CYAN}127.0.0.1:${PORT_LOCAL}${PLAIN} (免证书/本地回环)"
         echo -e "  用户 UUID     : ${CYAN}${UUID}${PLAIN}"
