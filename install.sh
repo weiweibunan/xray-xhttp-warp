@@ -33,14 +33,20 @@ get_subscript() {
 }
 
 ensure_ctl() {
-    if [ ! -s /usr/local/bin/xm ]; then
+    if [ -f "${SCRIPT_DIR}/scripts/xm_ctl.sh" ]; then
+        cp -f "${SCRIPT_DIR}/scripts/xm_ctl.sh" /usr/local/bin/xm
+    elif [ ! -s /usr/local/bin/xm ]; then
         curl -sSL "${REPO_URL}/scripts/xm_ctl.sh" -o /usr/local/bin/xm 2>/dev/null && chmod +x /usr/local/bin/xm || true
     fi
+    chmod +x /usr/local/bin/xm 2>/dev/null || true
     ln -sf /usr/local/bin/xm /usr/bin/xm 2>/dev/null || true
 
-    if [ ! -s /usr/local/bin/warp ]; then
+    if [ -f "${SCRIPT_DIR}/scripts/warp_ctl.sh" ]; then
+        cp -f "${SCRIPT_DIR}/scripts/warp_ctl.sh" /usr/local/bin/warp
+    elif [ ! -s /usr/local/bin/warp ]; then
         curl -sSL "${REPO_URL}/scripts/warp_ctl.sh" -o /usr/local/bin/warp 2>/dev/null && chmod +x /usr/local/bin/warp || true
     fi
+    chmod +x /usr/local/bin/warp 2>/dev/null || true
     ln -sf /usr/local/bin/warp /usr/bin/warp 2>/dev/null || true
 }
 
@@ -56,6 +62,12 @@ install_xray_only() {
     ensure_ctl
 }
 
+install_tunnel_only() {
+    local script=$(get_subscript "install_tunnel.sh")
+    bash "$script"
+    ensure_ctl
+}
+
 enable_bbr() {
     echo -e "\n${CYAN}>>> 检查并开启系统 TCP BBR 加速...${PLAIN}"
     CURRENT_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
@@ -64,14 +76,12 @@ enable_bbr() {
         return 0
     fi
 
-    # 遵循现代系统规范：使用 /etc/sysctl.d/99-bbr.conf 独立配置文件
     mkdir -p /etc/sysctl.d
     cat > /etc/sysctl.d/99-bbr.conf << 'BBRCONF'
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 BBRCONF
 
-    # 清理旧版 /etc/sysctl.conf 历史遗留并重载系统配置
     sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf 2>/dev/null || true
     sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf 2>/dev/null || true
     sysctl --system >/dev/null 2>&1 || sysctl -p /etc/sysctl.d/99-bbr.conf >/dev/null 2>&1
@@ -117,30 +127,32 @@ uninstall_all() {
     systemctl disable warp-proxy-autoconnect.service warp-svc.service 2>/dev/null || true
     apt purge -y cloudflare-warp 2>/dev/null || true
     rm -f /etc/systemd/system/warp-proxy-autoconnect.service /usr/local/bin/warp
-    systemctl daemon-reload
+    systemctl daemon-reload 2>/dev/null || true
     echo -e "${GREEN}✅ 全套服务已清理干净！${PLAIN}"
 }
 
 show_menu() {
     clear
-    echo -e "${BLUE}==================================================${PLAIN}"
-    echo -e "${GREEN}   xray-xhttp-warp 全官方原生网关一键安装程序     ${PLAIN}"
-    echo -e "${BLUE}==================================================${PLAIN}"
-    echo -e " ${GREEN}1.${PLAIN} 一键全套安装 (开启BBR + 官方WARP + Xray双节点 + AI分流) [推荐]"
-    echo -e " ${GREEN}2.${PLAIN} 仅安装 Cloudflare 官方 WARP (SOCKS5 40000 端口)"
-    echo -e " ${GREEN}3.${PLAIN} 仅安装 Xray (VLESS-XHTTP + AI 分流网关)"
-    echo -e " ${GREEN}4.${PLAIN} 开启/检查系统 TCP BBR 加速"
-    echo -e "--------------------------------------------------"
-    echo -e " ${RED}5.${PLAIN} 彻底卸载清理全套组件"
+    echo -e "${BLUE}====================================================================${PLAIN}"
+    echo -e "${GREEN}          xray-xhttp-warp 全官方原生网关一键安装程序                ${PLAIN}"
+    echo -e "${BLUE}====================================================================${PLAIN}"
+    echo -e " ${GREEN}1.${PLAIN} 一键全套安装 (开启BBR + 官方WARP + Xray双节点 + AI分流) [原生VPS推荐]"
+    echo -e " ${GREEN}2.${PLAIN} 容器/NAT穿透模式 (Cloudflare 隧道入栈 + 仅部署优选节点) [容器/无端口推荐]"
+    echo -e " ${GREEN}3.${PLAIN} 仅安装 Cloudflare 官方 WARP (SOCKS5 40000 端口)"
+    echo -e " ${GREEN}4.${PLAIN} 仅安装 Xray (原生双节点 + AI 分流网关)"
+    echo -e " ${GREEN}5.${PLAIN} 开启/检查系统 TCP BBR 加速"
+    echo -e "--------------------------------------------------------------------"
+    echo -e " ${RED}6.${PLAIN} 彻底卸载清理全套组件"
     echo -e " ${YELLOW}0.${PLAIN} 退出向导"
-    echo -e "${BLUE}==================================================${PLAIN}"
-    read -p "请输入选项 [0-5]: " choice
+    echo -e "${BLUE}====================================================================${PLAIN}"
+    read -p "请输入选项 [0-6]: " choice
     case "$choice" in
         1) install_all ;;
-        2) install_warp_only ;;
-        3) install_xray_only ;;
-        4) enable_bbr ;;
-        5) uninstall_all ;;
+        2) install_tunnel_only ;;
+        3) install_warp_only ;;
+        4) install_xray_only ;;
+        5) enable_bbr ;;
+        6) uninstall_all ;;
         0) exit 0 ;;
         *) echo -e "${RED}输入无效！${PLAIN}" ;;
     esac
@@ -148,6 +160,7 @@ show_menu() {
 
 case "$1" in
     all) install_all ;;
+    tunnel|container) install_tunnel_only ;;
     warp) install_warp_only ;;
     xray) install_xray_only ;;
     bbr) enable_bbr ;;
