@@ -155,6 +155,17 @@ prepare_port_80() {
 
 install_issued_cert() {
     local main_domain="$1"
+    # 停用此前指向同一 Xray 证书路径的旧域名托管，防止 --cron 续期时反向覆盖当前证书
+    local old_conf old_dom
+    for old_conf in /root/.acme.sh/*/*.conf; do
+        [ -f "$old_conf" ] || continue
+        old_dom=$(basename "$(dirname "$old_conf")" | sed -E 's/_ecc$//')
+        [ "$old_dom" = "$main_domain" ] && continue
+        if grep -qE "Le_RealFullChainPath=['\"]?${CERT_FILE}['\"]?" "$old_conf" 2>/dev/null; then
+            "$ACME_SH" --remove -d "$old_dom" --ecc >/dev/null 2>&1 || "$ACME_SH" --remove -d "$old_dom" >/dev/null 2>&1 || true
+        fi
+    done
+
     mkdir -p "$CERT_OUT_DIR"
     "$ACME_SH" --install-cert -d "$main_domain" --ecc \
         --fullchain-file "$CERT_FILE" \
@@ -177,6 +188,22 @@ install_issued_cert() {
     echo -e "  - 有效期限 : $(openssl x509 -in "$CERT_FILE" -noout -enddate 2>/dev/null | cut -d= -f2)"
     echo -e "  - 自动续期 : 已配置 acme.sh 定时任务，续期后自动重启 Xray"
     echo -e "${GREEN}==================================================${PLAIN}"
+}
+
+run_acme_issue() {
+    local domain="$1"
+    shift
+    local rc=0
+    "$ACME_SH" --issue "$@" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        install_issued_cert "$domain"
+        return $?
+    elif [ "$rc" -eq 2 ]; then
+        log_info "ℹ️ 检测到 ${domain} 在 acme.sh 中已有未到期有效证书，直接安装并应用！"
+        install_issued_cert "$domain"
+        return $?
+    fi
+    return "$rc"
 }
 
 issue_standalone_domain() {
@@ -216,9 +243,7 @@ issue_standalone_domain() {
     local extra_flags=""
     [ "$listen_v6" = "true" ] && extra_flags="--listen-v6"
 
-    if "$ACME_SH" --issue -d "$domain" --standalone -k ec-256 --server letsencrypt $extra_flags; then
-        install_issued_cert "$domain"
-    else
+    if ! run_acme_issue "$domain" -d "$domain" --standalone -k ec-256 --server letsencrypt $extra_flags; then
         log_err "❌ 域名证书签发失败！请检查：1) 80 端口公网入站防火墙是否放行；2) 域名解析是否关闭 CDN 小黄云并指向本机。"
         return 1
     fi
@@ -286,11 +311,9 @@ issue_dns_api() {
         log_info ">>> 检测到泛域名，将同时签发 ${apex} 与 ${domain}（SAN 将优先匹配根域以兼容直连与 CDN 节点）。"
     fi
 
-    if "$ACME_SH" --issue --dns "$dns_type" "${domain_args[@]}" -k ec-256 --server letsencrypt; then
-        local main_d="$domain"
-        [[ "$domain" == \*.* ]] && main_d="${domain#\*.}"
-        install_issued_cert "$main_d"
-    else
+    local main_d="$domain"
+    [[ "$domain" == \*.* ]] && main_d="${domain#\*.}"
+    if ! run_acme_issue "$main_d" --dns "$dns_type" "${domain_args[@]}" -k ec-256 --server letsencrypt; then
         log_err "❌ DNS API 证书签发失败！请核对 API 密钥权限与域名归属。"
         return 1
     fi
@@ -314,9 +337,7 @@ issue_standalone_ip() {
     local extra_flags=""
     [[ "$target_ip" == *:* ]] && extra_flags="--listen-v6"
 
-    if "$ACME_SH" --issue -d "$target_ip" --standalone -k ec-256 --server letsencrypt --cert-profile shortlived $extra_flags; then
-        install_issued_cert "$target_ip"
-    else
+    if ! run_acme_issue "$target_ip" -d "$target_ip" --standalone -k ec-256 --server letsencrypt --cert-profile shortlived $extra_flags; then
         log_err "❌ IP 证书签发失败，请确认 80 端口公网可达且未触发速率限制。"
         return 1
     fi
