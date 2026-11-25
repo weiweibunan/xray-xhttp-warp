@@ -6,11 +6,11 @@
     "servers": [
       "https+local://1.1.1.1/dns-query",
       "https+local://8.8.8.8/dns-query",
-      "2606:4700:4700::1111",
-      "2001:4860:4860::8888",
+      "https+local://[2606:4700:4700::1111]/dns-query",
+      "https+local://[2001:4860:4860::8888]/dns-query",
       "localhost"
     ],
-    "queryStrategy": "UseIPv6"
+    "queryStrategy": "UseIP"
   },
   "inbounds": [
     {
@@ -40,8 +40,8 @@
           ],
           "certificates": [
             {
-              "certificateFile": "/root/ygkkkca/cert.crt",
-              "keyFile": "/root/ygkkkca/private.key"
+              "certificateFile": "/etc/xray/cert/cert.crt",
+              "keyFile": "/etc/xray/cert/private.key"
             }
           ]
         }
@@ -85,8 +85,8 @@
           ],
           "certificates": [
             {
-              "certificateFile": "/root/ygkkkca/cert.crt",
-              "keyFile": "/root/ygkkkca/private.key"
+              "certificateFile": "/etc/xray/cert/cert.crt",
+              "keyFile": "/etc/xray/cert/private.key"
             }
           ]
         }
@@ -108,7 +108,7 @@
       "protocol": "freedom",
       "streamSettings": {
         "sockopt": {
-          "domainStrategy": "UseIPv6",
+          "domainStrategy": "ForceIPv6",
           "dialerProxy": "socks-warp"
         }
       }
@@ -135,10 +135,16 @@
     "rules": [
       {
         "type": "field",
+        "outboundTag": "block",
+        "ip": [
+          "geoip:private"
+        ]
+      },
+      {
+        "type": "field",
         "outboundTag": "warp-ipv6-out",
         "domain": [
           "geosite:openai",
-          "geosite:google-gemini",
           "geosite:google-deepmind"
         ]
       },

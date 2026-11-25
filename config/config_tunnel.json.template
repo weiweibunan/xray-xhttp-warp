@@ -6,8 +6,10 @@
     "servers": [
       "https+local://1.1.1.1/dns-query",
       "https+local://8.8.8.8/dns-query",
+      "https+local://[2606:4700:4700::1111]/dns-query",
       "localhost"
-    ]
+    ],
+    "queryStrategy": "UseIP"
   },
   "inbounds": [
     {
@@ -27,6 +29,11 @@
       "streamSettings": {
         "network": "xhttp",
         "security": "none",
+        "sockopt": {
+          "trustedXForwardedFor": [
+            "CF-Connecting-IP"
+          ]
+        },
         "xhttpSettings": {
           "mode": "auto",
           "path": "/YOUR_UUID_HERE-xc"
@@ -48,6 +55,7 @@
       "tag": "warp-out",
       "protocol": "wireguard",
       "settings": {
+        "noKernelTun": true,
         "secretKey": "YOUR_WARP_SECRET_KEY_HERE",
         "address": [
           "172.16.0.2/32",
@@ -60,6 +68,11 @@
           }
         ],
         "mtu": 1280
+      },
+      "streamSettings": {
+        "sockopt": {
+          "domainStrategy": "ForceIPv6"
+        }
       }
     },
     {
@@ -72,10 +85,16 @@
     "rules": [
       {
         "type": "field",
+        "outboundTag": "block",
+        "ip": [
+          "geoip:private"
+        ]
+      },
+      {
+        "type": "field",
         "outboundTag": "warp-out",
         "domain": [
           "geosite:openai",
-          "geosite:google-gemini",
           "geosite:google-deepmind"
         ]
       },

@@ -1,100 +1,147 @@
 #!/bin/bash
 # ==============================================================================
 # Cloudflare WARP 官方客户端简易管理命令 (/usr/local/bin/warp)
+# 单文件自包含
 # ==============================================================================
 
-CLI=$(command -v warp-cli)
+CLI=$(command -v warp-cli || true)
 
 if [ -z "$CLI" ]; then
-  echo "❌ 未检测到 warp-cli 客户端，请先安装 cloudflare-warp！"
-  exit 1
+    echo "❌ 未检测到 warp-cli 客户端，请先安装 cloudflare-warp！"
+    exit 1
 fi
 
-case "$1" in
-  register)
-    $CLI --accept-tos registration new
-    ;;
-
-  unregister)
-    $CLI --accept-tos registration delete
-    ;;
-
-  start|connect)
-    $CLI --accept-tos connect
-    ;;
-
-  stop|disconnect)
-    $CLI --accept-tos disconnect
-    ;;
-
-  restart)
-    $CLI --accept-tos disconnect || true
-    sleep 1
-    $CLI --accept-tos connect
-    ;;
-
-  status)
-    $CLI --accept-tos status
-    ;;
-
-  info)
-    $CLI --accept-tos registration show
-    ;;
-
-  port)
-    if [ -z "$2" ]; then
-      echo "用法: warp port 40000"
-      exit 1
+require_root() {
+    if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+        echo "❌ 此操作需要 root 权限，请使用 sudo 或 root 执行！"
+        exit 1
     fi
-    $CLI --accept-tos proxy port "$2"
-    ;;
+}
 
-  test)
-    echo ">>> 正在通过 SOCKS5 代理 (127.0.0.1:${2:-40000}) 测试 Cloudflare 连通性与 IP 出口..."
-    curl -fsS -x "socks5h://127.0.0.1:${2:-40000}" https://www.cloudflare.com/cdn-cgi/trace
-    ;;
+detect_socks_port() {
+    local custom="${1:-}"
+    if [ -n "$custom" ]; then
+        echo "$custom"
+        return 0
+    fi
+    local port
+    port=$("$CLI" --accept-tos settings 2>/dev/null | grep -iE 'proxy port|local proxy port' | grep -oE '[0-9]+' | tail -n1 || true)
+    if [ -z "$port" ] && [ -f /etc/xray/config.json ]; then
+        port=$(grep -A6 '"socks-warp"' /etc/xray/config.json 2>/dev/null | grep -oE '"port"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | head -n1 || true)
+    fi
+    echo "${port:-40000}"
+}
 
-  autostart)
-    case "$2" in
-      on)
-        systemctl enable --now warp-proxy-autoconnect.service
-        echo "✅ WARP 开机自启动已开启！"
+case "${1:-}" in
+    register)
+        require_root
+        "$CLI" --accept-tos registration new
         ;;
-      off)
-        systemctl disable --now warp-proxy-autoconnect.service
-        echo "⏸️ WARP 开机自启动已关闭！"
+
+    unregister)
+        require_root
+        "$CLI" --accept-tos registration delete
         ;;
-      *)
-        echo "用法: warp autostart on|off"
+
+    start|connect)
+        require_root
+        "$CLI" --accept-tos connect
         ;;
-    esac
-    ;;
 
-  logs)
-    journalctl -u warp-svc -n "${2:-100}" --no-pager
-    ;;
+    stop|disconnect)
+        require_root
+        "$CLI" --accept-tos disconnect
+        ;;
 
-  update)
-    apt update && apt install --only-upgrade -y cloudflare-warp
-    ;;
+    restart)
+        require_root
+        "$CLI" --accept-tos disconnect || true
+        sleep 1
+        "$CLI" --accept-tos connect
+        ;;
 
-  *)
-    echo "=================================================="
-    echo "       Cloudflare 官方原生 WARP SOCKS5 管理"
-    echo "=================================================="
-    echo "warp register       注册 WARP 客户端"
-    echo "warp unregister     注销当前注册设备"
-    echo "warp start          启动连接 (connect)"
-    echo "warp stop           断开连接 (disconnect)"
-    echo "warp restart        重启连接"
-    echo "warp status         查看连接状态"
-    echo "warp info           查看注册信息与设备 ID"
-    echo "warp port 40000     修改 SOCKS5 监听端口"
-    echo "warp test           测试 SOCKS5 代理出口 IP"
-    echo "warp autostart on   开启开机自动连接服务"
-    echo "warp autostart off  关闭开机自动连接服务"
-    echo "warp logs           查看后台服务日志"
-    echo "warp update         更新官方客户端软件包"
-    echo "=================================================="
-    ;;
+    status)
+        "$CLI" --accept-tos status
+        ;;
+
+    info)
+        "$CLI" --accept-tos registration show
+        ;;
+
+    port)
+        require_root
+        if [ -z "${2:-}" ] || [[ ! "${2:-}" =~ ^[0-9]+$ ]] || [ "${2}" -lt 1 ] || [ "${2}" -gt 65535 ]; then
+            echo "用法: warp port <1-65535> (例如: warp port 40000)"
+            exit 1
+        fi
+        "$CLI" --accept-tos proxy port "$2"
+        ;;
+
+    test)
+        PORT=$(detect_socks_port "${2:-}")
+        echo ">>> 正在通过 SOCKS5 代理 (127.0.0.1:${PORT}) 测试 Cloudflare 双栈连通性与 WARP 出口..."
+        echo "--- IPv4 检测 ---"
+        curl -fsS --connect-timeout 5 --max-time 10 -x "socks5h://127.0.0.1:${PORT}" https://1.1.1.1/cdn-cgi/trace | grep -E '^(ip|loc|warp)=' || echo "IPv4 检测超时或未通"
+        echo "--- IPv6 检测 (AI 分流核心通道) ---"
+        curl -fsS --connect-timeout 5 --max-time 10 -x "socks5h://127.0.0.1:${PORT}" "https://[2606:4700:4700::1111]/cdn-cgi/trace" | grep -E '^(ip|loc|warp)=' || echo "IPv6 检测超时或未通"
+        ;;
+
+    autostart)
+        require_root
+        case "${2:-}" in
+            on)
+                systemctl enable --now warp-proxy-autoconnect.service
+                echo "✅ WARP 开机自启动已开启！"
+                ;;
+            off)
+                systemctl disable --now warp-proxy-autoconnect.service
+                echo "⏸️ WARP 开机自启动已关闭！"
+                ;;
+            *)
+                echo "用法: warp autostart on|off"
+                exit 1
+                ;;
+        esac
+        ;;
+
+    logs)
+        if command -v journalctl >/dev/null 2>&1 && systemctl --version >/dev/null 2>&1; then
+            journalctl -u warp-svc -n "${2:-100}" --no-pager
+        else
+            echo "❌ 当前环境未运行 Systemd，无法查看 journalctl 日志。"
+            exit 1
+        fi
+        ;;
+
+    update)
+        require_root
+        if ! command -v apt-get >/dev/null 2>&1; then
+            echo "❌ 当前系统不支持 apt-get 更新！"
+            exit 1
+        fi
+        DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install --only-upgrade -y cloudflare-warp
+        systemctl restart warp-svc 2>/dev/null || true
+        sleep 2
+        "$CLI" --accept-tos connect 2>/dev/null || true
+        ;;
+
+    *)
+        echo "=================================================="
+        echo "       Cloudflare 官方原生 WARP SOCKS5 管理"
+        echo "=================================================="
+        echo "warp register       注册 WARP 客户端"
+        echo "warp unregister     注销当前注册设备"
+        echo "warp start          启动连接 (connect)"
+        echo "warp stop           断开连接 (disconnect)"
+        echo "warp restart        重启连接"
+        echo "warp status         查看连接状态"
+        echo "warp info           查看注册信息与设备 ID"
+        echo "warp port 40000     修改 SOCKS5 监听端口"
+        echo "warp test [端口]    测试 IPv4 & IPv6 出口状态"
+        echo "warp autostart on   开启开机自动连接服务"
+        echo "warp autostart off  关闭开机自动连接服务"
+        echo "warp logs [行数]    查看后台服务日志"
+        echo "warp update         更新官方客户端软件包"
+        echo "=================================================="
+        ;;
 esac

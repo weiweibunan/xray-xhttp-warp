@@ -1,10 +1,12 @@
 [Unit]
 Description=Cloudflare Tunnel Agent
-After=network.target
+After=network-online.target xray.service
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=root
+EnvironmentFile=/etc/xray/tunnel.env
 ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate run
 Restart=on-failure
 RestartSec=5s

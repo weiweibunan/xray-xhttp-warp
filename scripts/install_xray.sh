@@ -5,81 +5,163 @@
 
 set -e
 
-GREEN="\033[32m"
-YELLOW="\033[33m"
-RED="\033[31m"
-BLUE="\033[34m"
-PLAIN="\033[0m"
+REPO_URL="${REPO_URL:-https://raw.githubusercontent.com/weiweibunan/xray-xhttp-warp/main}"
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
-CERT_DIR="/root/ygkkkca"
-CERT="${CERT_DIR}/cert.crt"
-KEY="${CERT_DIR}/private.key"
-SOCKS_PORT=40000
-PORT_H3=8443
-PORT_XC=443
-CONFIG="/etc/xray/config.json"
+if [ -f "${SCRIPT_DIR}/common.sh" ]; then
+    . "${SCRIPT_DIR}/common.sh"
+elif [ -f "${SCRIPT_DIR}/scripts/common.sh" ]; then
+    . "${SCRIPT_DIR}/scripts/common.sh"
+else
+    _COMMON_TMP=$(mktemp /tmp/xray-common.XXXXXX.sh)
+    if ! curl -fsSL --connect-timeout 15 --retry 3 "${REPO_URL}/scripts/common.sh" -o "$_COMMON_TMP"; then
+        rm -f "$_COMMON_TMP"
+        echo "❌ 下载公共函数库 scripts/common.sh 失败！"
+        exit 1
+    fi
+    . "$_COMMON_TMP"
+    rm -f "$_COMMON_TMP"
+fi
 
-if [ ! -f "$CERT" ] || [ ! -f "$KEY" ]; then
-    echo -e "${RED}❌ 未检测到证书文件！${PLAIN}"
-    echo -e "${YELLOW}请确保已将证书存放在：${PLAIN}"
-    echo "  公钥: $CERT"
-    echo "  私钥: $KEY"
+require_root
+detect_arch
+
+if ! is_systemd; then
+    log_err "❌ 原生双节点模式需要 Systemd 环境；容器/无 Systemd 请使用: bash install.sh tunnel"
     exit 1
 fi
 
-echo -e "${GREEN}>>> [XRAY 1/5] 安装必要系统依赖...${PLAIN}"
-if command -v apt-get >/dev/null 2>&1; then
-    apt-get update -y && apt-get install -y curl unzip openssl
-elif command -v yum >/dev/null 2>&1; then
-    yum install -y curl unzip openssl
-fi
+resolve_or_issue_xray_cert "$SCRIPT_DIR"
+CERT="$CERT_PATH"
+KEY="$KEY_PATH"
+SOCKS_PORT=40000
+PORT_H3=8443
+PORT_XC=443
 
-echo -e "${GREEN}>>> [XRAY 2/5] 下载官方最新 Xray 内核...${PLAIN}"
-ARCH=$(uname -m)
-case "$ARCH" in
-  x86_64|amd64) FILE="Xray-linux-64.zip" ;;
-  aarch64|arm64) FILE="Xray-linux-arm64-v8a.zip" ;;
-  *) echo -e "${RED}不支持的 CPU 架构: $ARCH${PLAIN}"; exit 1 ;;
-esac
-
-TMP_DIR=$(mktemp -d)
-curl -sSL "https://github.com/XTLS/Xray-core/releases/latest/download/${FILE}" -o "${TMP_DIR}/xray.zip"
-mkdir -p /usr/local/bin /etc/xray /usr/local/share/xray
-unzip -qo "${TMP_DIR}/xray.zip" xray -d /usr/local/bin/
-chmod +x /usr/local/bin/xray
-rm -rf "$TMP_DIR"
-
-echo -e "${GREEN}>>> [XRAY 3/5] 下载并安装 geosite.dat 与 geoip.dat 规则库...${PLAIN}"
-ensure_dat() {
-    local file=$1
-    local target="/usr/local/share/xray/$file"
-    local size=0
-    [ -f "$target" ] && size=$(wc -c < "$target" 2>/dev/null || echo 0)
-    if [ "$size" -lt 1000000 ]; then
-        curl -sSL --retry 3 "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/$file" -o "$target" || \
-        curl -sSL --retry 3 "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/$file" -o "$target"
+# 检查端口冲突（允许已存在的 xray 进程覆盖升级）
+if conflict=$(check_port_conflict tcp "$PORT_XC"); then
+    log_warn "⚠️ 检测到 TCP ${PORT_XC} 端口已被其他进程占用: ${conflict}"
+    read_tty -p "请输入自定义 TCP 监听端口 (如 2053/2083/2096，回车中止安装): " CUSTOM_XC
+    CUSTOM_XC=$(echo "$CUSTOM_XC" | tr -dc '0-9')
+    if [ -z "$CUSTOM_XC" ] || [ "$CUSTOM_XC" -lt 1 ] || [ "$CUSTOM_XC" -gt 65535 ]; then
+        log_err "❌ 已中止安装，请先释放 ${PORT_XC} 端口或指定有效端口。"
+        exit 1
     fi
-    cp -f "$target" /usr/local/bin/
-    cp -f "$target" /etc/xray/
-}
-ensure_dat geosite.dat
-ensure_dat geoip.dat
-
-UUID=$(grep -oE '"id": "[0-9a-fA-F-]{36}"' $CONFIG 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
-[ -z "$UUID" ] && UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || tr -dc 'a-f0-9' < /dev/urandom | head -c 32 | sed -E 's/(.{8})(.{4})(.{4})(.{4})(.{12})/\1-\2-\3-\4-\5/')
-
-IP=$(curl -s4 https://icanhazip.com || curl -s4 https://api.ipify.org)
-SNI=$(openssl x509 -in "$CERT" -noout -text 2>/dev/null | grep -A1 "Subject Alternative Name" | tail -n1 | grep -oE "(DNS:[^, ]+|IP Address:[^, ]+)" | head -n1 | sed -E 's/(DNS:|IP Address:)//' || true)
-if [ -z "$SNI" ]; then
-    SNI=$(openssl x509 -in "$CERT" -noout -subject 2>/dev/null | sed -n 's/.*CN[ =]*//p' || true)
+    PORT_XC="$CUSTOM_XC"
 fi
-[ -z "$SNI" ] && SNI="$IP"
+
+if conflict=$(check_port_conflict udp "$PORT_H3"); then
+    log_warn "⚠️ 检测到 UDP ${PORT_H3} 端口已被其他进程占用: ${conflict}"
+    read_tty -p "请输入自定义 H3/UDP 监听端口 (如 2087/8444，回车中止安装): " CUSTOM_H3
+    CUSTOM_H3=$(echo "$CUSTOM_H3" | tr -dc '0-9')
+    if [ -z "$CUSTOM_H3" ] || [ "$CUSTOM_H3" -lt 1 ] || [ "$CUSTOM_H3" -gt 65535 ]; then
+        log_err "❌ 已中止安装，请先释放 ${PORT_H3} 端口或指定有效端口。"
+        exit 1
+    fi
+    PORT_H3="$CUSTOM_H3"
+fi
+
+log_ok ">>> [XRAY 1/5] 安装必要系统依赖..."
+install_pkg curl unzip openssl jq ca-certificates
+
+if ! openssl x509 -in "$CERT" -noout >/dev/null 2>&1; then
+    log_err "❌ 证书文件格式无效: $CERT"
+    exit 1
+fi
+
+# 可选：标准原生 VPS 同时启用 Cloudflare Tunnel 隧道入栈节点
+OPT_CF_TUNNEL=false
+PREV_CF_ENABLED=""
+[ -f "$TUNNEL_CONF" ] && PREV_CF_ENABLED=$(grep -E '^CF_TUNNEL_ENABLED=' "$TUNNEL_CONF" 2>/dev/null | head -n1 | cut -d'=' -f2- | tr -d "\"' \r" || true)
+
+if [ "${ENABLE_CF_TUNNEL:-}" = "1" ]; then
+    OPT_CF_TUNNEL=true
+elif [ "${ENABLE_CF_TUNNEL:-}" = "0" ]; then
+    OPT_CF_TUNNEL=false
+else
+    echo -e "\n${BLUE}--------------------------------------------------${PLAIN}"
+    if [ "$PREV_CF_ENABLED" = "1" ]; then
+        read_tty -p "检测到此前已额外开启 Cloudflare Tunnel 隧道节点，是否继续保留/更新？[Y/n]: " cf_choice || cf_choice="y"
+        [[ "$cf_choice" != "n" && "$cf_choice" != "N" ]] && OPT_CF_TUNNEL=true
+    else
+        read_tty -p "是否在原有节点(CDN优选/TCP/H3)基础上，额外新增 Cloudflare Tunnel 隧道节点？(可选) [y/N]: " cf_choice || cf_choice="n"
+        [[ "$cf_choice" == "y" || "$cf_choice" == "Y" ]] && OPT_CF_TUNNEL=true
+    fi
+fi
+
+if [ "$OPT_CF_TUNNEL" = "true" ]; then
+    prompt_tunnel_params 8080
+    while true; do
+        if [[ ! "$LOCAL_PORT" =~ ^[0-9]+$ ]] || [ "$LOCAL_PORT" -lt 1 ] || [ "$LOCAL_PORT" -gt 65535 ]; then
+            log_warn "⚠️ 隧道本地端口无效 (${LOCAL_PORT})，必须是 1-65535 之间的数字！"
+        elif [ "$LOCAL_PORT" = "$PORT_XC" ] || [ "$LOCAL_PORT" = "$PORT_H3" ] || check_port_conflict tcp "$LOCAL_PORT" >/dev/null; then
+            log_warn "⚠️ 隧道本地端口 ${LOCAL_PORT} 与原生端口冲突或已被占用，请更换端口！"
+        else
+            break
+        fi
+        read_tty -p "请输入空闲本地监听端口 [如 8080/18080]: " LOCAL_PORT
+        LOCAL_PORT=$(echo "$LOCAL_PORT" | tr -d ' \r\n')
+    done
+    log_info ">>> 下载并安装 Cloudflare 官方 cloudflared 客户端..."
+    install_cloudflared
+fi
+
+log_ok ">>> [XRAY 2/5] 下载并校验官方最新 Xray 内核..."
+install_xray_core
+
+log_ok ">>> [XRAY 3/5] 下载并校验 geosite.dat 与 geoip.dat 规则库..."
+ensure_dat
+
+UUID=$(extract_uuid_from_config "$XRAY_CONFIG")
+[ -z "$UUID" ] && UUID=$(generate_uuid)
 
 PATH_H3="/${UUID}-xu"
 PATH_XC="/${UUID}-xc"
+PATH_XT="/${UUID}-xt"
 
-echo -e "${GREEN}>>> [XRAY 4/5] 写入生产级 /etc/xray/config.json 配置文件...${PLAIN}"
-cat > $CONFIG << JSON
+TUNNEL_INBOUND_JSON=""
+if [ "$OPT_CF_TUNNEL" = "true" ]; then
+    TUNNEL_INBOUND_JSON=",{
+      \"tag\": \"xhttp-tunnel-in\",
+      \"listen\": \"127.0.0.1\",
+      \"port\": ${LOCAL_PORT},
+      \"protocol\": \"vless\",
+      \"settings\": {
+        \"clients\": [
+          {
+            \"id\": \"${UUID}\",
+            \"flow\": \"\"
+          }
+        ],
+        \"decryption\": \"none\"
+      },
+      \"streamSettings\": {
+        \"network\": \"xhttp\",
+        \"security\": \"none\",
+        \"sockopt\": {
+          \"trustedXForwardedFor\": [
+            \"CF-Connecting-IP\"
+          ]
+        },
+        \"xhttpSettings\": {
+          \"mode\": \"auto\",
+          \"path\": \"${PATH_XT}\"
+        }
+      },
+      \"sniffing\": {
+        \"enabled\": true,
+        \"destOverride\": [\"http\", \"tls\", \"quic\"],
+        \"metadataOnly\": false
+      }
+    }"
+fi
+
+log_ok ">>> [XRAY 4/5] 生成并校验 /etc/xray/config.json 配置文件..."
+TMP_CFG_DIR=$(mktemp -d)
+TMP_CFG="${TMP_CFG_DIR}/config.json"
+trap 'rm -rf "$TMP_CFG_DIR"' EXIT
+
+cat > "$TMP_CFG" << JSON
 {
   "log": {
     "loglevel": "error"
@@ -88,11 +170,11 @@ cat > $CONFIG << JSON
     "servers": [
       "https+local://1.1.1.1/dns-query",
       "https+local://8.8.8.8/dns-query",
-      "2606:4700:4700::1111",
-      "2001:4860:4860::8888",
+      "https+local://[2606:4700:4700::1111]/dns-query",
+      "https+local://[2001:4860:4860::8888]/dns-query",
       "localhost"
     ],
-    "queryStrategy": "UseIPv6"
+    "queryStrategy": "UseIP"
   },
   "inbounds": [
     {
@@ -178,7 +260,7 @@ cat > $CONFIG << JSON
         "destOverride": ["http", "tls", "quic"],
         "metadataOnly": false
       }
-    }
+    }${TUNNEL_INBOUND_JSON}
   ],
   "outbounds": [
     {
@@ -190,7 +272,7 @@ cat > $CONFIG << JSON
       "protocol": "freedom",
       "streamSettings": {
         "sockopt": {
-          "domainStrategy": "UseIPv6",
+          "domainStrategy": "ForceIPv6",
           "dialerProxy": "socks-warp"
         }
       }
@@ -217,10 +299,16 @@ cat > $CONFIG << JSON
     "rules": [
       {
         "type": "field",
+        "outboundTag": "block",
+        "ip": [
+          "geoip:private"
+        ]
+      },
+      {
+        "type": "field",
         "outboundTag": "warp-ipv6-out",
         "domain": [
           "geosite:openai",
-          "geosite:google-gemini",
           "geosite:google-deepmind"
         ]
       },
@@ -234,53 +322,76 @@ cat > $CONFIG << JSON
 }
 JSON
 
-echo -e "${GREEN}>>> [XRAY 5/5] 配置 Systemd 服务与开机自启动...${PLAIN}"
+atomic_write_xray_config "$TMP_CFG" "$XRAY_CONFIG"
+
+if [ "$OPT_CF_TUNNEL" = "true" ]; then
+    cat > "$TUNNEL_CONF" << EOF
+CF_TUNNEL_DOMAIN="${CF_DOMAIN}"
+CF_LOCAL_PORT="${LOCAL_PORT}"
+TUNNEL_MODE="0"
+CF_TUNNEL_ENABLED="1"
+WARP_ENABLED="1"
+EOF
+    chmod 600 "$TUNNEL_CONF"
+
+    cat > "$TUNNEL_ENV" << EOF
+TUNNEL_TOKEN=${CF_TOKEN}
+EOF
+    chmod 600 "$TUNNEL_ENV"
+
+    write_cloudflared_systemd_unit
+else
+    # 未启用可选隧道时清理残留隧道配置，避免 xm 状态误判
+    systemctl stop cloudflared 2>/dev/null || true
+    systemctl disable cloudflared 2>/dev/null || true
+    rm -f "$TUNNEL_CONF" "$TUNNEL_ENV" /etc/systemd/system/cloudflared.service
+fi
+
+log_ok ">>> [XRAY 5/5] 配置 Systemd 服务与开机自启动..."
 cat > /etc/systemd/system/xray.service << SERVICE
 [Unit]
 Description=Xray Service
-After=network.target
+Documentation=https://github.com/xtls
+After=network.target nss-lookup.target warp-svc.service
+Wants=warp-svc.service
 
 [Service]
-Type=simple
 User=root
-Environment="XRAY_LOCATION_ASSET=/usr/local/share/xray"
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+Environment="XRAY_LOCATION_ASSET=${XRAY_ASSET_DIR}"
 ExecStart=/usr/local/bin/xray run -c /etc/xray/config.json
 Restart=on-failure
 RestartSec=5s
+RestartPreventExitStatus=23
+LimitNPROC=10000
+LimitNOFILE=1000000
 
 [Install]
 WantedBy=multi-user.target
 SERVICE
 
 systemctl daemon-reload
-/usr/local/bin/xray -test -config $CONFIG
-systemctl enable --now xray
+systemctl enable xray
 systemctl restart xray
-
-# 放行端口
-if command -v ufw >/dev/null 2>&1; then
-    ufw allow 443/tcp >/dev/null 2>&1 || true
-    ufw allow 8443/udp >/dev/null 2>&1 || true
-    ufw allow 8443/tcp >/dev/null 2>&1 || true
-elif command -v firewall-cmd >/dev/null 2>&1; then
-    firewall-cmd --add-port=443/tcp --permanent >/dev/null 2>&1 || true
-    firewall-cmd --add-port=8443/udp --permanent >/dev/null 2>&1 || true
-    firewall-cmd --add-port=8443/tcp --permanent >/dev/null 2>&1 || true
-    firewall-cmd --reload >/dev/null 2>&1 || true
+if [ "$OPT_CF_TUNNEL" = "true" ]; then
+    systemctl enable cloudflared
+    systemctl restart cloudflared
 fi
+sleep 1
+if ! systemctl is-active --quiet xray; then
+    log_err "❌ Xray 服务启动失败，最近日志如下："
+    journalctl -u xray -n 15 --no-pager || true
+    exit 1
+fi
+
+# 放行端口 (兼容 ufw / firewalld / iptables)
+open_firewall_port tcp "$PORT_XC"
+open_firewall_port udp "$PORT_H3"
 
 # 安装 xm 管理命令并建立全局软链接
-REPO_URL="https://raw.githubusercontent.com/weiweibunan/xray-xhttp-warp/main"
-SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-if [ -f "${SCRIPT_DIR}/xm_ctl.sh" ]; then
-    cp -f "${SCRIPT_DIR}/xm_ctl.sh" /usr/local/bin/xm
-elif [ -f "${SCRIPT_DIR}/scripts/xm_ctl.sh" ]; then
-    cp -f "${SCRIPT_DIR}/scripts/xm_ctl.sh" /usr/local/bin/xm
-else
-    curl -sSL "${REPO_URL}/scripts/xm_ctl.sh" -o /usr/local/bin/xm
-fi
-chmod +x /usr/local/bin/xm
-ln -sf /usr/local/bin/xm /usr/bin/xm
+install_ctl_script "xm_ctl.sh" "/usr/local/bin/xm" "/usr/bin/xm" "$SCRIPT_DIR"
 
 # 打印节点信息
 if [ -x /usr/local/bin/xm ]; then

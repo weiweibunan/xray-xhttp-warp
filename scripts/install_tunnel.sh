@@ -7,220 +7,353 @@
 
 set -e
 
-GREEN="\033[32m"
-YELLOW="\033[33m"
-RED="\033[31m"
-BLUE="\033[34m"
-CYAN="\033[36m"
-PLAIN="\033[0m"
+REPO_URL="${REPO_URL:-https://raw.githubusercontent.com/weiweibunan/xray-xhttp-warp/main}"
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
-CONFIG="/etc/xray/config.json"
-TUNNEL_CONF="/etc/xray/tunnel.conf"
-
-if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}❌ 请使用 root 权限执行此脚本！${PLAIN}"
-    exit 1
+if [ -f "${SCRIPT_DIR}/common.sh" ]; then
+    . "${SCRIPT_DIR}/common.sh"
+elif [ -f "${SCRIPT_DIR}/scripts/common.sh" ]; then
+    . "${SCRIPT_DIR}/scripts/common.sh"
+else
+    _COMMON_TMP=$(mktemp /tmp/xray-common.XXXXXX.sh)
+    if ! curl -fsSL --connect-timeout 15 --retry 3 "${REPO_URL}/scripts/common.sh" -o "$_COMMON_TMP"; then
+        rm -f "$_COMMON_TMP"
+        echo "❌ 下载公共函数库 scripts/common.sh 失败！"
+        exit 1
+    fi
+    . "$_COMMON_TMP"
+    rm -f "$_COMMON_TMP"
 fi
 
-is_systemd() {
-    [ -d /run/systemd/system ] && systemctl --version >/dev/null 2>&1 && [ "$(ps -p 1 -o comm= 2>/dev/null)" = "systemd" ]
-}
+require_root
+detect_arch
+
+WARP_CACHE_FILE="/etc/xray/warp-tunnel.json"
 
 echo -e "${BLUE}====================================================================${PLAIN}"
 echo -e "${GREEN}    Xray 容器/NAT 穿透模式安装向导 (Cloudflare Tunnel + WARP 分流)   ${PLAIN}"
 echo -e "${BLUE}====================================================================${PLAIN}"
 echo -e "${CYAN}说明：此模式利用 Cloudflare 官方隧道从容器内部主动向外建立连接，${PLAIN}"
 echo -e "${CYAN}      无需容器开放任何公网端口，本地无需申请 SSL 证书；${PLAIN}"
-echo -e "${CYAN}      同时集成纯用户态 WireGuard WARP 出口，解锁 OpenAI / Gemini AI 分流！${PLAIN}"
+echo -e "${CYAN}      同时集成纯用户态 WireGuard WARP 出口，强制 IPv6 解锁 OpenAI / Gemini！${PLAIN}"
 echo -e "${BLUE}--------------------------------------------------------------------${PLAIN}"
 
-# 1. 交互式输入 Cloudflare Tunnel Token
-DEFAULT_TOKEN=""
-[ -f "$TUNNEL_CONF" ] && DEFAULT_TOKEN=$(grep -E '^CF_TUNNEL_TOKEN=' "$TUNNEL_CONF" 2>/dev/null | cut -d'=' -f2- | tr -d '"'\')
-
-while true; do
-    if [ -n "$DEFAULT_TOKEN" ]; then
-        read -p "请输入 Cloudflare Tunnel Token [回车保持现有]: " INPUT_TOKEN
-        [ -z "$INPUT_TOKEN" ] && INPUT_TOKEN="$DEFAULT_TOKEN"
-    else
-        read -p "请输入 Cloudflare Tunnel Token (隧道密钥): " INPUT_TOKEN
-    fi
-
-    # 清洗用户可能误粘贴的整串命令 (例如 cloudflared tunnel run --token eyJh... 或 service install eyJh...)
-    CF_TOKEN=$(echo "$INPUT_TOKEN" | sed -E 's/.*(--token|service install)[ =]+//; s/^[ \t]*//; s/[ \t]*$//' | tr -d '\r\n"')
-    if [ -n "$CF_TOKEN" ]; then
-        break
-    else
-        echo -e "${RED}❌ Token 不能为空，请从 Cloudflare Zero Trust 控制台复制！${PLAIN}"
-    fi
-done
-
-# 2. 交互式输入隧道绑定的公共域名
-DEFAULT_DOMAIN=""
-[ -f "$TUNNEL_CONF" ] && DEFAULT_DOMAIN=$(grep -E '^CF_TUNNEL_DOMAIN=' "$TUNNEL_CONF" 2>/dev/null | cut -d'=' -f2- | tr -d '"'\')
-
-while true; do
-    if [ -n "$DEFAULT_DOMAIN" ]; then
-        read -p "请输入 Cloudflare 绑定的隧道域名 (如 tryaltare.20000805.xyz) [回车保持现有]: " INPUT_DOMAIN
-        [ -z "$INPUT_DOMAIN" ] && INPUT_DOMAIN="$DEFAULT_DOMAIN"
-    else
-        read -p "请输入 Cloudflare 绑定的隧道域名 (如 tryaltare.20000805.xyz): " INPUT_DOMAIN
-    fi
-
-    CF_DOMAIN=$(echo "$INPUT_DOMAIN" | sed -E 's#^https?://##; s#/.*$##' | tr -d ' \r\n"' | tr '[:upper:]' '[:lower:]')
-    if [ -n "$CF_DOMAIN" ]; then
-        break
-    else
-        echo -e "${RED}❌ 域名不能为空！${PLAIN}"
-    fi
-done
-
-# 3. 本地监听端口
-read -p "请输入本地 Xray 监听端口 [默认 8080]: " LOCAL_PORT
-LOCAL_PORT=$(echo "$LOCAL_PORT" | tr -dc '0-9')
-[ -z "$LOCAL_PORT" ] && LOCAL_PORT=8080
+# 1-3. 交互式输入 Token、域名与本地监听端口
+prompt_tunnel_params 8080
 
 echo -e "${BLUE}--------------------------------------------------------------------${PLAIN}"
 echo -e "配置确认："
 echo -e "  - 隧道域名 : ${CYAN}${CF_DOMAIN}${PLAIN}"
 echo -e "  - 本地端口 : ${CYAN}127.0.0.1:${LOCAL_PORT}${PLAIN}"
-echo -e "  - AI 分流  : ${GREEN}OpenAI + Gemini -> Cloudflare WARP (WireGuard 原生出站)${PLAIN}"
+echo -e "  - AI 分流  : ${GREEN}OpenAI + Gemini -> Cloudflare WARP (WireGuard ForceIPv6)${PLAIN}"
 echo -e "  - 运行环境 : $(is_systemd && echo "${GREEN}标准系统 (Systemd)${PLAIN}" || echo "${YELLOW}轻量容器/沙箱 (进程自守护)${PLAIN}")"
 echo -e "${BLUE}--------------------------------------------------------------------${PLAIN}"
 
-echo -e "\n${GREEN}>>> [TUNNEL 1/6] 安装必要系统依赖...${PLAIN}"
-if command -v apt-get >/dev/null 2>&1; then
-    apt-get update -y && apt-get install -y curl unzip procps ca-certificates
-elif command -v yum >/dev/null 2>&1; then
-    yum install -y curl unzip procps ca-certificates
-fi
+log_ok "\n>>> [TUNNEL 1/6] 安装必要系统依赖..."
+install_pkg curl unzip procps ca-certificates jq
 
-echo -e "${GREEN}>>> [TUNNEL 2/6] 下载并安装 Xray 官方内核与规则库...${PLAIN}"
-ARCH=$(uname -m)
-case "$ARCH" in
-  x86_64|amd64) FILE="Xray-linux-64.zip" ;;
-  aarch64|arm64) FILE="Xray-linux-arm64-v8a.zip" ;;
-  *) echo -e "${RED}不支持的 CPU 架构: $ARCH${PLAIN}"; exit 1 ;;
-esac
-
-TMP_DIR=$(mktemp -d)
-curl -sSL "https://github.com/XTLS/Xray-core/releases/latest/download/${FILE}" -o "${TMP_DIR}/xray.zip"
-mkdir -p /usr/local/bin /etc/xray /usr/local/share/xray
-unzip -qo "${TMP_DIR}/xray.zip" xray -d /usr/local/bin/
-chmod +x /usr/local/bin/xray
-rm -rf "$TMP_DIR"
-
-ensure_dat() {
-    local file=$1
-    local target="/usr/local/share/xray/$file"
-    local size=0
-    [ -f "$target" ] && size=$(wc -c < "$target" 2>/dev/null || echo 0)
-    if [ "$size" -lt 1000000 ]; then
-        curl -sSL --retry 3 "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/$file" -o "$target" || \
-        curl -sSL --retry 3 "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/$file" -o "$target"
-    fi
-    cp -f "$target" /usr/local/bin/
-    cp -f "$target" /etc/xray/
-}
-ensure_dat geosite.dat
-ensure_dat geoip.dat
-
-echo -e "${GREEN}>>> [TUNNEL 3/6] 下载 Cloudflare 官方 cloudflared 客户端...${PLAIN}"
-CF_BIN="/usr/local/bin/cloudflared"
-case "$ARCH" in
-  x86_64|amd64) CF_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64" ;;
-  aarch64|arm64) CF_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64" ;;
-  *) CF_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-386" ;;
-esac
-curl -sSL "$CF_URL" -o "$CF_BIN"
-chmod +x "$CF_BIN"
-
-echo -e "${GREEN}>>> [TUNNEL 4/6] 配置 Cloudflare WARP 原生 WireGuard 出口分流...${PLAIN}"
-WARP_DIR="/var/lib/cloudflare-warp"
-mkdir -p "$WARP_DIR"
-
-if ! command -v warp-cli >/dev/null 2>&1; then
-    echo -e "${CYAN}安装官方 Cloudflare WARP 客户端用于安全获取原生密钥...${PLAIN}"
-    if command -v apt-get >/dev/null 2>&1; then
-        mkdir -p /usr/share/keyrings
-        curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg 2>/dev/null || true
-        . /etc/os-release 2>/dev/null || true
-        CODENAME="${VERSION_CODENAME:-bookworm}"
-        echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${CODENAME} main" > /etc/apt/sources.list.d/cloudflare-client.list 2>/dev/null || true
-        apt-get update -y && apt-get install -y cloudflare-warp 2>/dev/null || true
+if conflict=$(check_port_conflict tcp "$LOCAL_PORT"); then
+    log_warn "⚠️ 检测到本地 TCP ${LOCAL_PORT} 端口已被其他进程占用: ${conflict}"
+    read_tty -p "请输入空闲本地监听端口 [回车中止安装]: " ALT_PORT
+    if [[ "$ALT_PORT" =~ ^[0-9]+$ ]] && [ "$ALT_PORT" -ge 1 ] && [ "$ALT_PORT" -le 65535 ]; then
+        LOCAL_PORT="$ALT_PORT"
+    else
+        log_err "❌ 已中止安装。"
+        exit 1
     fi
 fi
 
-NEED_REG=false
-if [ ! -f "${WARP_DIR}/reg.json" ] || [ ! -f "${WARP_DIR}/conf.json" ]; then
-    NEED_REG=true
-elif ! grep -q 'curve25519' "${WARP_DIR}/conf.json" 2>/dev/null; then
-    NEED_REG=true
-fi
+log_ok ">>> [TUNNEL 2/6] 下载并校验 Xray 官方内核与规则库..."
+install_xray_core
+ensure_dat
 
-if [ "$NEED_REG" = "true" ] && command -v warp-cli >/dev/null 2>&1; then
-    echo -e "${CYAN}向 Cloudflare 官方注册专属 WARP WireGuard 账户...${PLAIN}"
-    pkill -x warp-svc 2>/dev/null || true
-    nohup /usr/bin/warp-svc >/dev/null 2>&1 &
-    sleep 2
-    warp-cli --accept-tos registration new 2>/dev/null || true
-    warp-cli --accept-tos tunnel protocol set WireGuard 2>/dev/null || true
-    sleep 1
-    pkill -x warp-svc 2>/dev/null || true
-fi
+log_ok ">>> [TUNNEL 3/6] 下载并安装 Cloudflare 官方 cloudflared 客户端..."
+install_cloudflared
 
-WARP_SECRET_KEY=$(grep -o '"secret_key":"[^"]*' "${WARP_DIR}/reg.json" 2>/dev/null | cut -d'"' -f4 || true)
-WARP_IPV4=$(grep -o '"v4":"[^"]*' "${WARP_DIR}/conf.json" 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
-WARP_IPV6=$(grep -o '"v6":"[^"]*' "${WARP_DIR}/conf.json" 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
-[ -z "$WARP_IPV4" ] && WARP_IPV4="172.16.0.2"
-[ -z "$WARP_IPV6" ] && WARP_IPV6="2606:4700:110:81ec:2cd0:332c:af20:33e5"
-WARP_ENDPOINT="162.159.192.1:2408"
+# ------------------------------------------------------------------------------
+# 辅助函数：通过官方 client 套件或纯官方注册接口获取真实 WARP WireGuard 凭据
+# ------------------------------------------------------------------------------
+WARP_SECRET_KEY=""
+WARP_IPV4=""
+WARP_IPV6=""
 WARP_PUBKEY="bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
+WARP_EP_V4="162.159.192.1:2408"
+WARP_EP_V6="[2606:4700:d0::a29f:c001]:2408"
+WARP_RESERVED_JSON=""
 
-if [ -n "$WARP_SECRET_KEY" ]; then
-    echo -e "${GREEN}✅ Cloudflare WARP WireGuard 凭据就绪！${PLAIN}"
-    WARP_OUTBOUND_JSON='{
-      "tag": "warp-out",
-      "protocol": "wireguard",
-      "settings": {
-        "secretKey": "'"${WARP_SECRET_KEY}"'",
-        "address": [
-          "'"${WARP_IPV4}"'/32",
-          "'"${WARP_IPV6}"'/128"
+decode_client_id_reserved() {
+    local b64="$1"
+    [ -z "$b64" ] && return 0
+    local bytes
+    bytes=$(printf '%s' "$b64" | base64 -d 2>/dev/null | od -An -tu1 2>/dev/null | tr -s ' ' | sed 's/^ //; s/ $//')
+    set -- $bytes
+    if [ "$#" -eq 3 ]; then
+        echo "[${1}, ${2}, ${3}]"
+    fi
+}
+
+is_valid_wg_key() {
+    [[ "${1:-}" =~ ^[A-Za-z0-9+/]{43}=$ ]]
+}
+
+try_load_cached_warp() {
+    [ -f "$WARP_CACHE_FILE" ] || return 1
+    WARP_SECRET_KEY=$(jq -r '.secret_key // empty' "$WARP_CACHE_FILE" 2>/dev/null || true)
+    WARP_IPV4=$(jq -r '.v4 // empty' "$WARP_CACHE_FILE" 2>/dev/null || true)
+    WARP_IPV6=$(jq -r '.v6 // empty' "$WARP_CACHE_FILE" 2>/dev/null || true)
+    local pub ep4 ep6 cid
+    pub=$(jq -r '.public_key // empty' "$WARP_CACHE_FILE" 2>/dev/null || true)
+    ep4=$(jq -r '.endpoint_v4 // empty' "$WARP_CACHE_FILE" 2>/dev/null || true)
+    ep6=$(jq -r '.endpoint_v6 // empty' "$WARP_CACHE_FILE" 2>/dev/null || true)
+    cid=$(jq -r '.client_id // empty' "$WARP_CACHE_FILE" 2>/dev/null || true)
+    [ -n "$pub" ] && WARP_PUBKEY="$pub"
+    [ -n "$ep4" ] && WARP_EP_V4="$ep4"
+    [ -n "$ep6" ] && WARP_EP_V6="$ep6"
+    WARP_RESERVED_JSON=$(decode_client_id_reserved "$cid")
+    is_valid_wg_key "$WARP_SECRET_KEY" && is_valid_wg_key "$WARP_PUBKEY" && [[ "$WARP_IPV6" == *:* ]]
+}
+
+save_cached_warp() {
+    local cid="$1"
+    mkdir -p /etc/xray
+    jq -n \
+        --arg sk "$WARP_SECRET_KEY" \
+        --arg v4 "$WARP_IPV4" \
+        --arg v6 "$WARP_IPV6" \
+        --arg pk "$WARP_PUBKEY" \
+        --arg ep4 "$WARP_EP_V4" \
+        --arg ep6 "$WARP_EP_V6" \
+        --arg cid "$cid" \
+        '{secret_key:$sk, v4:$v4, v6:$v6, public_key:$pk, endpoint_v4:$ep4, endpoint_v6:$ep6, client_id:$cid}' \
+        > "$WARP_CACHE_FILE"
+    chmod 600 "$WARP_CACHE_FILE"
+}
+
+try_warp_official_cli() {
+    command -v apt-get >/dev/null 2>&1 || return 1
+    is_systemd || return 1
+
+    local warp_dir="/var/lib/cloudflare-warp"
+    if ! command -v warp-cli >/dev/null 2>&1; then
+        log_info "安装官方 Cloudflare WARP 客户端以获取原生 WireGuard 密钥..."
+        install_pkg gnupg >/dev/null 2>&1 || return 1
+        mkdir -p /usr/share/keyrings
+        local tmp_gpg
+        tmp_gpg=$(mktemp)
+        if ! fetch_to_file "$tmp_gpg" "https://pkg.cloudflareclient.com/pubkey.gpg"; then
+            rm -f "$tmp_gpg"
+            return 1
+        fi
+        gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg < "$tmp_gpg" 2>/dev/null || { rm -f "$tmp_gpg"; return 1; }
+        rm -f "$tmp_gpg"
+        . /etc/os-release 2>/dev/null || true
+        local codename="${VERSION_CODENAME:-bookworm}"
+        if ! curl -fsI --connect-timeout 5 "https://pkg.cloudflareclient.com/dists/${codename}/Release" >/dev/null 2>&1; then
+            if [ "${ID:-}" = "ubuntu" ] || [[ "${ID_LIKE:-}" == *ubuntu* ]]; then
+                codename="noble"
+            else
+                codename="bookworm"
+            fi
+        fi
+        echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${codename} main" > /etc/apt/sources.list.d/cloudflare-client.list
+        install_pkg cloudflare-warp >/dev/null 2>&1 || return 1
+    fi
+
+    local was_active=false
+    systemctl is-active --quiet warp-svc && was_active=true
+    if [ "$was_active" != "true" ]; then
+        systemctl start warp-svc 2>/dev/null || return 1
+        for _i in $(seq 1 10); do
+            warp-cli --accept-tos status >/dev/null 2>&1 && break
+            sleep 1
+        done
+    fi
+
+    warp-cli --accept-tos registration show >/dev/null 2>&1 || warp-cli --accept-tos registration new >/dev/null 2>&1 || true
+    warp-cli --accept-tos tunnel protocol set WireGuard >/dev/null 2>&1 || true
+
+    # 等待 warp-svc 异步切换为 WireGuard (curve25519) 密钥，必要时触发一次连接同步
+    local wg_synced=false
+    for _i in $(seq 1 10); do
+        if [ "$(jq -r '.tunnel_key_data.key_type // empty' "${warp_dir}/conf.json" 2>/dev/null)" = "curve25519" ] && \
+           is_valid_wg_key "$(jq -r '.secret_key // empty' "${warp_dir}/reg.json" 2>/dev/null)"; then
+            wg_synced=true
+            break
+        fi
+        if [ "$_i" -eq 3 ]; then
+            warp-cli --accept-tos mode proxy >/dev/null 2>&1 || true
+            warp-cli --accept-tos connect >/dev/null 2>&1 || true
+            sleep 2
+            warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
+        fi
+        sleep 1
+    done
+
+    if [ "$was_active" != "true" ]; then
+        systemctl stop warp-svc 2>/dev/null || true
+    fi
+
+    [ "$wg_synced" = "true" ] || return 1
+
+    WARP_SECRET_KEY=$(jq -r '.secret_key // empty' "${warp_dir}/reg.json" 2>/dev/null || true)
+    WARP_IPV4=$(jq -r '.interface.v4 // empty' "${warp_dir}/conf.json" 2>/dev/null || true)
+    WARP_IPV6=$(jq -r '.interface.v6 // empty' "${warp_dir}/conf.json" 2>/dev/null || true)
+    local pub ep4 ep6 cid
+    pub=$(jq -r '.public_key // empty' "${warp_dir}/conf.json" 2>/dev/null || true)
+    ep4=$(jq -r '.endpoints[0].v4 // empty' "${warp_dir}/conf.json" 2>/dev/null || true)
+    ep6=$(jq -r '.endpoints[0].v6 // empty' "${warp_dir}/conf.json" 2>/dev/null || true)
+    cid=$(jq -r '.account.client_id // .client_id // empty' "${warp_dir}/conf.json" 2>/dev/null || true)
+    if is_valid_wg_key "$pub"; then
+        WARP_PUBKEY="$pub"
+    fi
+    [ -n "$ep4" ] && WARP_EP_V4="$ep4"
+    [ -n "$ep6" ] && WARP_EP_V6="$ep6"
+    WARP_RESERVED_JSON=$(decode_client_id_reserved "$cid")
+
+    if is_valid_wg_key "$WARP_SECRET_KEY" && is_valid_wg_key "$WARP_PUBKEY" && [[ "$WARP_IPV6" == *:* ]]; then
+        [ -z "$WARP_IPV4" ] && WARP_IPV4="172.16.0.2"
+        save_cached_warp "$cid"
+        return 0
+    fi
+    return 1
+}
+
+try_warp_official_api() {
+    log_info "使用 Xray 内置 Curve25519 工具向 Cloudflare 官方接口申请轻量 WARP 凭据..."
+    local wg_out priv_key pub_key install_id tos resp
+    wg_out=$("$XRAY_BIN" wg 2>/dev/null || true)
+    priv_key=$(echo "$wg_out" | awk '/^(Private|PrivateKey)/{print $NF}' | head -n1 | tr -d '\r')
+    pub_key=$(echo "$wg_out" | awk '/^(Public|Password)/{print $NF}' | head -n1 | tr -d '\r')
+    if [ -z "$priv_key" ] || [ -z "$pub_key" ]; then
+        return 1
+    fi
+
+    install_id=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 22)
+    tos=$(date -u +%Y-%m-%dT%H:%M:%S.000+00:00)
+
+    local payload
+    payload=$(jq -n \
+        --arg key "$pub_key" \
+        --arg iid "$install_id" \
+        --arg fcm "${install_id}:APA91b${install_id}" \
+        --arg tos "$tos" \
+        '{key:$key, install_id:$iid, fcm_token:$fcm, warp_enabled:true, tos:$tos, type:"Android", locale:"en_US"}')
+
+    resp=$(curl -fsSL --connect-timeout 15 --retry 2 \
+        -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
+        -H "Content-Type: application/json; charset=UTF-8" \
+        -H "User-Agent: okhttp/3.12.1" \
+        --data "$payload" 2>/dev/null || true)
+
+    [ -z "$resp" ] && return 1
+
+    WARP_SECRET_KEY="$priv_key"
+    WARP_IPV4=$(echo "$resp" | jq -r '.config.interface.addresses.v4 // empty' 2>/dev/null || true)
+    WARP_IPV6=$(echo "$resp" | jq -r '.config.interface.addresses.v6 // empty' 2>/dev/null || true)
+    local srv_pub ep4 ep6 cid
+    srv_pub=$(echo "$resp" | jq -r '.config.peers[0].public_key // empty' 2>/dev/null || true)
+    ep4=$(echo "$resp" | jq -r '.config.peers[0].endpoint.v4 // empty' 2>/dev/null || true)
+    ep6=$(echo "$resp" | jq -r '.config.peers[0].endpoint.v6 // empty' 2>/dev/null || true)
+    cid=$(echo "$resp" | jq -r '.config.client_id // empty' 2>/dev/null || true)
+
+    [ -n "$srv_pub" ] && WARP_PUBKEY="$srv_pub"
+    if [ -n "$ep4" ]; then
+        ep4="${ep4%:0}"
+        [[ "$ep4" == *:* ]] || ep4="${ep4}:2408"
+        WARP_EP_V4="$ep4"
+    fi
+    if [ -n "$ep6" ]; then
+        ep6="${ep6%:0}"
+        if [[ "$ep6" != \[* ]]; then
+            ep6="[${ep6}]:2408"
+        elif [[ "$ep6" != *]:* ]]; then
+            ep6="${ep6}:2408"
+        fi
+        WARP_EP_V6="$ep6"
+    fi
+    WARP_RESERVED_JSON=$(decode_client_id_reserved "$cid")
+
+    if [ -n "$WARP_SECRET_KEY" ] && [[ "$WARP_IPV6" == *:* ]]; then
+        [ -z "$WARP_IPV4" ] && WARP_IPV4="172.16.0.2"
+        save_cached_warp "$cid"
+        return 0
+    fi
+    return 1
+}
+
+log_ok ">>> [TUNNEL 4/6] 配置 Cloudflare WARP 原生 WireGuard 出口分流..."
+WARP_READY=false
+if try_load_cached_warp; then
+    WARP_READY=true
+    log_ok "✅ 已复用本地缓存的 Cloudflare WARP 凭据。"
+elif try_warp_official_cli; then
+    WARP_READY=true
+    log_ok "✅ 已通过官方 cloudflare-warp 客户端获取专属 WARP 凭据。"
+elif try_warp_official_api; then
+    WARP_READY=true
+    log_ok "✅ 已通过 Cloudflare 官方注册接口获取轻量 WARP 凭据。"
+fi
+
+if [ "$WARP_READY" = "true" ]; then
+    WARP_ENDPOINT="$WARP_EP_V4"
+    if ! has_ipv4 && has_ipv6; then
+        WARP_ENDPOINT="$WARP_EP_V6"
+    fi
+    RESERVED_LINE=""
+    [ -n "$WARP_RESERVED_JSON" ] && RESERVED_LINE="\"reserved\": ${WARP_RESERVED_JSON},"
+
+    WARP_OUTBOUND_JSON="{
+      \"tag\": \"warp-out\",
+      \"protocol\": \"wireguard\",
+      \"settings\": {
+        \"noKernelTun\": true,
+        \"secretKey\": \"${WARP_SECRET_KEY}\",
+        \"address\": [
+          \"${WARP_IPV4}/32\",
+          \"${WARP_IPV6}/128\"
         ],
-        "peers": [
+        ${RESERVED_LINE}
+        \"peers\": [
           {
-            "publicKey": "'"${WARP_PUBKEY}"'",
-            "endpoint": "'"${WARP_ENDPOINT}"'"
+            \"publicKey\": \"${WARP_PUBKEY}\",
+            \"endpoint\": \"${WARP_ENDPOINT}\"
           }
         ],
-        "mtu": 1280
+        \"mtu\": 1280
+      },
+      \"streamSettings\": {
+        \"sockopt\": {
+          \"domainStrategy\": \"ForceIPv6\"
+        }
       }
-    },'
+    },"
     WARP_ROUTING_RULE='{
         "type": "field",
         "outboundTag": "warp-out",
         "domain": [
           "geosite:openai",
-          "geosite:google-gemini",
           "geosite:google-deepmind"
         ]
       },'
     WARP_ENABLED_FLAG="1"
+    log_ok "✅ Cloudflare WARP WireGuard 凭据就绪 (Endpoint: ${WARP_ENDPOINT}, IPv6: ${WARP_IPV6})！"
 else
-    echo -e "${YELLOW}⚠️ 未能获取到 WARP 密钥，默认退化为直连出站。${PLAIN}"
+    log_warn "⚠️ 未能获取到有效的 Cloudflare WARP 凭据，AI 流量将暂退化为直连出站。"
     WARP_OUTBOUND_JSON=""
     WARP_ROUTING_RULE=""
     WARP_ENABLED_FLAG="0"
 fi
 
-echo -e "${GREEN}>>> [TUNNEL 5/6] 写入隧道入栈与分流 Xray 配置...${PLAIN}"
-UUID=$(grep -oE '"id": "[0-9a-fA-F-]{36}"' $CONFIG 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
-[ -z "$UUID" ] && UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || tr -dc 'a-f0-9' < /dev/urandom | head -c 32 | sed -E 's/(.{8})(.{4})(.{4})(.{4})(.{12})/\1-\2-\3-\4-\5/')
-
+log_ok ">>> [TUNNEL 5/6] 生成并校验隧道入栈 Xray 配置..."
+UUID=$(extract_uuid_from_config "$XRAY_CONFIG")
+[ -z "$UUID" ] && UUID=$(generate_uuid)
 PATH_XC="/${UUID}-xc"
 
-cat > "$CONFIG" << JSON
+TMP_CFG_DIR=$(mktemp -d)
+TMP_CFG="${TMP_CFG_DIR}/config.json"
+trap 'rm -rf "$TMP_CFG_DIR"' EXIT
+
+cat > "$TMP_CFG" << JSON
 {
   "log": {
     "loglevel": "error"
@@ -229,8 +362,10 @@ cat > "$CONFIG" << JSON
     "servers": [
       "https+local://1.1.1.1/dns-query",
       "https+local://8.8.8.8/dns-query",
+      "https+local://[2606:4700:4700::1111]/dns-query",
       "localhost"
-    ]
+    ],
+    "queryStrategy": "UseIP"
   },
   "inbounds": [
     {
@@ -250,6 +385,11 @@ cat > "$CONFIG" << JSON
       "streamSettings": {
         "network": "xhttp",
         "security": "none",
+        "sockopt": {
+          "trustedXForwardedFor": [
+            "CF-Connecting-IP"
+          ]
+        },
         "xhttpSettings": {
           "mode": "auto",
           "path": "${PATH_XC}"
@@ -276,6 +416,13 @@ cat > "$CONFIG" << JSON
   "routing": {
     "domainStrategy": "AsIs",
     "rules": [
+      {
+        "type": "field",
+        "outboundTag": "block",
+        "ip": [
+          "geoip:private"
+        ]
+      },
       ${WARP_ROUTING_RULE}
       {
         "type": "field",
@@ -287,105 +434,84 @@ cat > "$CONFIG" << JSON
 }
 JSON
 
-# 保存隧道与 WARP 元数据供 xm 管理命令读取
+atomic_write_xray_config "$TMP_CFG" "$XRAY_CONFIG"
+
+# 保存隧道元数据与环境变量密钥文件（600 权限，避免命令行明文泄漏 Token）
 cat > "$TUNNEL_CONF" << EOF
-CF_TUNNEL_TOKEN="${CF_TOKEN}"
 CF_TUNNEL_DOMAIN="${CF_DOMAIN}"
 CF_LOCAL_PORT="${LOCAL_PORT}"
 TUNNEL_MODE="1"
+CF_TUNNEL_ENABLED="1"
 WARP_ENABLED="${WARP_ENABLED_FLAG}"
 EOF
 chmod 600 "$TUNNEL_CONF"
 
-/usr/local/bin/xray -test -config "$CONFIG"
+cat > "$TUNNEL_ENV" << EOF
+TUNNEL_TOKEN=${CF_TOKEN}
+EOF
+chmod 600 "$TUNNEL_ENV"
 
-echo -e "${GREEN}>>> [TUNNEL 6/6] 启动并守护服务 (自动适配环境)...${PLAIN}"
+log_ok ">>> [TUNNEL 6/6] 启动并守护服务 (自动适配环境)..."
 if is_systemd; then
-    echo -e "${CYAN}检测到 Systemd，正在配置守护服务...${PLAIN}"
+    log_info "检测到 Systemd，正在配置安全守护服务..."
     cat > /etc/systemd/system/xray.service << SERVICE
 [Unit]
 Description=Xray Service
-After=network.target
+Documentation=https://github.com/xtls
+After=network.target nss-lookup.target
 
 [Service]
-Type=simple
 User=root
-Environment="XRAY_LOCATION_ASSET=/usr/local/share/xray"
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+Environment="XRAY_LOCATION_ASSET=${XRAY_ASSET_DIR}"
 ExecStart=/usr/local/bin/xray run -c /etc/xray/config.json
 Restart=on-failure
 RestartSec=5s
+RestartPreventExitStatus=23
+LimitNPROC=10000
+LimitNOFILE=1000000
 
 [Install]
 WantedBy=multi-user.target
 SERVICE
 
-    cat > /etc/systemd/system/cloudflared.service << SERVICE
-[Unit]
-Description=Cloudflare Tunnel Agent
-After=network.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate run --token ${CF_TOKEN}
-Restart=on-failure
-RestartSec=5s
-
-[Install]
-WantedBy=multi-user.target
-SERVICE
+    write_cloudflared_systemd_unit
 
     systemctl daemon-reload
-    systemctl enable --now xray cloudflared
+    systemctl enable xray cloudflared
     systemctl restart xray cloudflared
 else
-    echo -e "${YELLOW}检测到非 Systemd 环境（Docker/PRoot 容器），采用后台自守护模式...${PLAIN}"
+    log_warn "检测到非 Systemd 环境（Docker/PRoot 容器），采用后台自守护模式..."
     pkill -x xray 2>/dev/null || true
     pkill -x cloudflared 2>/dev/null || true
     sleep 1
 
-    nohup /usr/local/bin/xray run -c /etc/xray/config.json > /var/log/xray.log 2>&1 &
-    nohup /usr/local/bin/cloudflared tunnel --no-autoupdate run --token "$CF_TOKEN" > /var/log/cloudflared.log 2>&1 &
+    XRAY_LOCATION_ASSET="$XRAY_ASSET_DIR" nohup /usr/local/bin/xray run -c /etc/xray/config.json > /var/log/xray.log 2>&1 &
+    ( set -a; . "$TUNNEL_ENV"; exec /usr/local/bin/cloudflared tunnel --no-autoupdate --loglevel warn run ) > /var/log/cloudflared.log 2>&1 &
 
-    # 在 .bashrc 和 /etc/profile 中注入保活启动钩子
+    cleanup_autostart_hooks
+
     AUTORUN_CODE='
-# [xray-xhttp-warp] Container Autostart Hook
-if [ -f /etc/xray/tunnel.conf ]; then
+# BEGIN [xray-xhttp-warp]
+if [ "$(id -u)" -eq 0 ] && [ -f /etc/xray/tunnel.conf ] && [ -r /etc/xray/tunnel.env ]; then
     if ! pgrep -x xray >/dev/null 2>&1; then
-        nohup /usr/local/bin/xray run -c /etc/xray/config.json >/var/log/xray.log 2>&1 &
+        XRAY_LOCATION_ASSET=/usr/local/share/xray nohup /usr/local/bin/xray run -c /etc/xray/config.json >/var/log/xray.log 2>&1 &
     fi
     if ! pgrep -x cloudflared >/dev/null 2>&1; then
-        . /etc/xray/tunnel.conf
-        if [ -n "$CF_TUNNEL_TOKEN" ]; then
-            nohup /usr/local/bin/cloudflared tunnel --no-autoupdate run --token "$CF_TUNNEL_TOKEN" >/var/log/cloudflared.log 2>&1 &
-        fi
-    fi
-fi'
-
-    if ! grep -q "xray/tunnel.conf" /root/.bashrc 2>/dev/null; then
-        echo "$AUTORUN_CODE" >> /root/.bashrc
-    fi
-    if [ -f /etc/profile ] && ! grep -q "xray/tunnel.conf" /etc/profile 2>/dev/null; then
-        echo "$AUTORUN_CODE" >> /etc/profile
+        ( set -a; . /etc/xray/tunnel.env; exec /usr/local/bin/cloudflared tunnel --no-autoupdate --loglevel warn run ) >/var/log/cloudflared.log 2>&1 &
     fi
 fi
+# END [xray-xhttp-warp]'
 
-# 安装 xm 管理命令
-REPO_URL="https://raw.githubusercontent.com/weiweibunan/xray-xhttp-warp/main"
-SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-if [ -f "${SCRIPT_DIR}/xm_ctl.sh" ]; then
-    cp -f "${SCRIPT_DIR}/xm_ctl.sh" /usr/local/bin/xm
-elif [ -f "${SCRIPT_DIR}/scripts/xm_ctl.sh" ]; then
-    cp -f "${SCRIPT_DIR}/scripts/xm_ctl.sh" /usr/local/bin/xm
-else
-    curl -sSL "${REPO_URL}/scripts/xm_ctl.sh" -o /usr/local/bin/xm 2>/dev/null || true
+    echo "$AUTORUN_CODE" >> /root/.bashrc
+    [ -f /etc/profile ] && echo "$AUTORUN_CODE" >> /etc/profile
 fi
-chmod +x /usr/local/bin/xm
-ln -sf /usr/local/bin/xm /usr/bin/xm 2>/dev/null || true
 
+# 安装 xm 管理命令并展示节点信息
+install_ctl_script "xm_ctl.sh" "/usr/local/bin/xm" "/usr/bin/xm" "$SCRIPT_DIR"
 sleep 2
-
-# 展示节点信息
 if [ -x /usr/local/bin/xm ]; then
     /usr/local/bin/xm info
 fi
