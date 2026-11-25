@@ -333,11 +333,16 @@ show_info() {
     echo -e "${BLUE}==================================================${PLAIN}"
 }
 
-start_cloudflared_container() {
+ensure_tunnel_env_file() {
     if [ -n "$TUNNEL_TOKEN" ] && [ ! -f "$TUNNEL_ENV" ]; then
+        mkdir -p "$(dirname "$TUNNEL_ENV")"
         printf 'TUNNEL_TOKEN=%s\n' "$TUNNEL_TOKEN" > "$TUNNEL_ENV"
         chmod 600 "$TUNNEL_ENV"
     fi
+}
+
+start_cloudflared_container() {
+    ensure_tunnel_env_file
     if [ -f "$TUNNEL_ENV" ]; then
         ( set -a; . "$TUNNEL_ENV"; exec nohup "$CF_BIN" tunnel --no-autoupdate --loglevel warn run ) >/var/log/cloudflared.log 2>&1 &
     fi
@@ -358,7 +363,10 @@ start_xray() {
     load_tunnel_meta
     if is_systemd; then
         systemctl start xray
-        is_tunnel_active && systemctl start cloudflared
+        if is_tunnel_active; then
+            ensure_tunnel_env_file
+            systemctl start cloudflared
+        fi
     else
         if ! is_proc_alive xray; then
             XRAY_LOCATION_ASSET="$XRAY_ASSET_DIR" nohup "$XRAY_BIN" run -c "$CONFIG" >/var/log/xray.log 2>&1 &
@@ -391,7 +399,10 @@ restart_xray() {
     load_tunnel_meta
     if is_systemd; then
         systemctl restart xray
-        is_tunnel_active && systemctl restart cloudflared 2>/dev/null || true
+        if is_tunnel_active; then
+            ensure_tunnel_env_file
+            systemctl restart cloudflared 2>/dev/null || true
+        fi
     else
         stop_proc_graceful xray
         stop_proc_graceful cloudflared
