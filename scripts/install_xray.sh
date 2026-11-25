@@ -34,35 +34,18 @@ fi
 resolve_or_issue_xray_cert "$SCRIPT_DIR"
 CERT="$CERT_PATH"
 KEY="$KEY_PATH"
+log_ok ">>> [XRAY 1/5] 安装必要系统依赖..."
+install_pkg curl unzip openssl jq ca-certificates
+ensure_net_tools
+
 SOCKS_PORT=40000
 PORT_H3=8443
 PORT_XC=443
 
-# 检查端口冲突（允许已存在的 xray 进程覆盖升级）
-if conflict=$(check_port_conflict tcp "$PORT_XC"); then
-    log_warn "⚠️ 检测到 TCP ${PORT_XC} 端口已被其他进程占用: ${conflict}"
-    read_tty -p "请输入自定义 TCP 监听端口 (如 2053/2083/2096，回车中止安装): " CUSTOM_XC
-    CUSTOM_XC=$(echo "$CUSTOM_XC" | tr -dc '0-9')
-    if [ -z "$CUSTOM_XC" ] || [ "$CUSTOM_XC" -lt 1 ] || [ "$CUSTOM_XC" -gt 65535 ]; then
-        log_err "❌ 已中止安装，请先释放 ${PORT_XC} 端口或指定有效端口。"
-        exit 1
-    fi
-    PORT_XC="$CUSTOM_XC"
-fi
-
-if conflict=$(check_port_conflict udp "$PORT_H3"); then
-    log_warn "⚠️ 检测到 UDP ${PORT_H3} 端口已被其他进程占用: ${conflict}"
-    read_tty -p "请输入自定义 H3/UDP 监听端口 (如 2087/8444，回车中止安装): " CUSTOM_H3
-    CUSTOM_H3=$(echo "$CUSTOM_H3" | tr -dc '0-9')
-    if [ -z "$CUSTOM_H3" ] || [ "$CUSTOM_H3" -lt 1 ] || [ "$CUSTOM_H3" -gt 65535 ]; then
-        log_err "❌ 已中止安装，请先释放 ${PORT_H3} 端口或指定有效端口。"
-        exit 1
-    fi
-    PORT_H3="$CUSTOM_H3"
-fi
-
-log_ok ">>> [XRAY 1/5] 安装必要系统依赖..."
-install_pkg curl unzip openssl jq ca-certificates
+resolve_free_port tcp "$PORT_XC" "TCP" "如 2053/2083/2096" || exit 1
+PORT_XC="$RESOLVED_PORT"
+resolve_free_port udp "$PORT_H3" "H3/UDP" "如 2087/8444" || exit 1
+PORT_H3="$RESOLVED_PORT"
 
 if ! openssl x509 -in "$CERT" -noout >/dev/null 2>&1; then
     log_err "❌ 证书文件格式无效: $CERT"

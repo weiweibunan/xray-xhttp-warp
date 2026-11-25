@@ -51,17 +51,12 @@ echo -e "${BLUE}----------------------------------------------------------------
 
 log_ok "\n>>> [TUNNEL 1/6] 安装必要系统依赖..."
 install_pkg curl unzip procps ca-certificates jq
+ensure_net_tools
 
-if conflict=$(check_port_conflict tcp "$LOCAL_PORT"); then
-    log_warn "⚠️ 检测到本地 TCP ${LOCAL_PORT} 端口已被其他进程占用: ${conflict}"
-    read_tty -p "请输入空闲本地监听端口 [回车中止安装]: " ALT_PORT
-    if [[ "$ALT_PORT" =~ ^[0-9]+$ ]] && [ "$ALT_PORT" -ge 1 ] && [ "$ALT_PORT" -le 65535 ]; then
-        LOCAL_PORT="$ALT_PORT"
-    else
-        log_err "❌ 已中止安装。"
-        exit 1
-    fi
+if ! resolve_free_port tcp "$LOCAL_PORT" "本地隧道 TCP" "如 8080/18080"; then
+    exit 1
 fi
+LOCAL_PORT="$RESOLVED_PORT"
 
 log_ok ">>> [TUNNEL 2/6] 下载并校验 Xray 官方内核与规则库..."
 install_xray_core
@@ -85,7 +80,7 @@ decode_client_id_reserved() {
     local b64="$1"
     [ -z "$b64" ] && return 0
     local bytes
-    bytes=$(printf '%s' "$b64" | base64 -d 2>/dev/null | od -An -tu1 2>/dev/null | tr -s ' ' | sed 's/^ //; s/ $//')
+    bytes=$(printf '%s' "$b64" | base64 -d 2>/dev/null | od -An -tu1 2>/dev/null | tr -s ' ' | sed 's/^ //; s/ $//' || true)
     set -- $bytes
     if [ "$#" -eq 3 ]; then
         echo "[${1}, ${2}, ${3}]"
@@ -484,23 +479,29 @@ SERVICE
     systemctl restart xray cloudflared
 else
     log_warn "检测到非 Systemd 环境（Docker/PRoot 容器），采用后台自守护模式..."
-    pkill -x xray 2>/dev/null || true
-    pkill -x cloudflared 2>/dev/null || true
-    sleep 1
+    for _p in xray cloudflared; do
+        pkill -x "$_p" 2>/dev/null || true
+        for _i in $(seq 1 25); do
+            ps -eo stat=,comm= 2>/dev/null | awk -v t="$_p" '$1 !~ /^Z/ && $2 == t {f=1} END{exit !f}' || break
+            sleep 0.2
+        done
+        pkill -9 -x "$_p" 2>/dev/null || true
+    done
+    sleep 0.2
 
     XRAY_LOCATION_ASSET="$XRAY_ASSET_DIR" nohup /usr/local/bin/xray run -c /etc/xray/config.json > /var/log/xray.log 2>&1 &
-    ( set -a; . "$TUNNEL_ENV"; exec /usr/local/bin/cloudflared tunnel --no-autoupdate --loglevel warn run ) > /var/log/cloudflared.log 2>&1 &
+    ( set -a; . "$TUNNEL_ENV"; exec nohup /usr/local/bin/cloudflared tunnel --no-autoupdate --loglevel warn run ) > /var/log/cloudflared.log 2>&1 &
 
     cleanup_autostart_hooks
 
     AUTORUN_CODE='
 # BEGIN [xray-xhttp-warp]
 if [ "$(id -u)" -eq 0 ] && [ -f /etc/xray/tunnel.conf ] && [ -r /etc/xray/tunnel.env ]; then
-    if ! pgrep -x xray >/dev/null 2>&1; then
+    if ! ps -eo stat=,comm= 2>/dev/null | awk '\''$1 !~ /^Z/ && $2 == "xray"{f=1} END{exit !f}'\''; then
         XRAY_LOCATION_ASSET=/usr/local/share/xray nohup /usr/local/bin/xray run -c /etc/xray/config.json >/var/log/xray.log 2>&1 &
     fi
-    if ! pgrep -x cloudflared >/dev/null 2>&1; then
-        ( set -a; . /etc/xray/tunnel.env; exec /usr/local/bin/cloudflared tunnel --no-autoupdate --loglevel warn run ) >/var/log/cloudflared.log 2>&1 &
+    if ! ps -eo stat=,comm= 2>/dev/null | awk '\''$1 !~ /^Z/ && $2 == "cloudflared"{f=1} END{exit !f}'\''; then
+        ( set -a; . /etc/xray/tunnel.env; exec nohup /usr/local/bin/cloudflared tunnel --no-autoupdate --loglevel warn run ) >/var/log/cloudflared.log 2>&1 &
     fi
 fi
 # END [xray-xhttp-warp]'

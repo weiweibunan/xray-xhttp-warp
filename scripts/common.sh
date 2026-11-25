@@ -73,7 +73,7 @@ detect_arch() {
 install_pkg() {
     if command -v apt-get >/dev/null 2>&1; then
         DEBIAN_FRONTEND=noninteractive apt-get update -y
-        DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@"
     elif command -v dnf >/dev/null 2>&1; then
         dnf install -y "$@"
     elif command -v yum >/dev/null 2>&1; then
@@ -150,6 +150,7 @@ install_xray_core() {
 ensure_dat() {
     local force="${1:-}"
     mkdir -p "$XRAY_ASSET_DIR"
+    log_info ">>> 规则库来源: https://github.com/Loyalsoldier/v2ray-rules-dat"
     local file target tmp_dir tmp_file sum_file expected actual size
     for file in geosite.dat geoip.dat; do
         target="${XRAY_ASSET_DIR}/${file}"
@@ -361,6 +362,17 @@ extract_uuid_from_config() {
     fi
 }
 
+ensure_net_tools() {
+    if command -v ss >/dev/null 2>&1 || command -v netstat >/dev/null 2>&1; then
+        return 0
+    fi
+    if command -v apt-get >/dev/null 2>&1 || command -v apk >/dev/null 2>&1; then
+        install_pkg iproute2 || true
+    elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+        install_pkg iproute || true
+    fi
+}
+
 check_port_conflict() {
     local proto="$1"
     local port="$2"
@@ -374,11 +386,33 @@ check_port_conflict() {
         return 1
     fi
     [ -z "$line" ] && return 1
-    if echo "$line" | grep -q "xray"; then
+    if echo "$line" | grep -qE '"xray"|[0-9]+/xray'; then
         return 1
     fi
     echo "$line"
     return 0
+}
+
+resolve_free_port() {
+    local proto="$1"
+    local port="$2"
+    local label="${3:-$proto}"
+    local hint="${4:-}"
+    local conflict input
+    while conflict=$(check_port_conflict "$proto" "$port"); do
+        log_warn "⚠️ 检测到 ${label} ${port} 端口已被其他进程占用: ${conflict}"
+        while true; do
+            read_tty -p "请输入自定义 ${label} 监听端口 (${hint}，直接回车中止安装): " input || return 1
+            [ -z "$input" ] && { log_err "❌ 已中止安装，请先释放 ${port} 端口或指定有效端口。"; return 1; }
+            input=$(echo "$input" | tr -d ' \r\n')
+            if [[ "$input" =~ ^[0-9]+$ ]] && [ "$input" -ge 1 ] && [ "$input" -le 65535 ]; then
+                port="$input"
+                break
+            fi
+            log_err "❌ 端口必须是 1-65535 之间的数字！"
+        done
+    done
+    RESOLVED_PORT="$port"
 }
 
 open_firewall_port() {
@@ -505,13 +539,7 @@ resolve_or_issue_xray_cert() {
         return 0
     fi
 
-    if [ -f "/root/ygkkkca/cert.crt" ] && [ -f "/root/ygkkkca/private.key" ]; then
-        export CERT_PATH="/root/ygkkkca/cert.crt" KEY_PATH="/root/ygkkkca/private.key"
-        log_ok "✅ 已自动检测到兼容路径证书: ${CERT_PATH}"
-        return 0
-    fi
-
-    log_warn "⚠️ 未在默认路径 (/etc/xray/cert 或 /root/ygkkkca) 检测到 TLS 证书，原生模式必须配置域名证书。"
+    log_warn "⚠️ 未在默认路径 /etc/xray/cert 检测到 TLS 证书，原生模式必须配置域名证书。"
     while true; do
         echo -e "${BLUE}--------------------------------------------------${PLAIN}"
         echo -e " ${GREEN}1.${PLAIN} 一键申请免费 SSL 证书 (集成官方 acme.sh) [推荐]"

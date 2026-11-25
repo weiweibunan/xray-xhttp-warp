@@ -124,7 +124,7 @@ prepare_port_80() {
         log_warn "⚠️ 检测到 80/tcp 端口当前被占用："
         echo "$conflict"
         local ans
-        read_tty -p "是否临时停止占用 80 端口的服务 (常见如 nginx/caddy/apache2) 并释放 80 端口？(y/n): " ans
+        read_tty -p "是否临时停止占用 80 端口的服务 (常见如 nginx/caddy/apache2) 并释放 80 端口？(y/n): " ans || ans="n"
         if [[ "$ans" != "y" && "$ans" != "Y" ]]; then
             log_err "❌ 80 端口被占用，无法继续 HTTP-01 验证。建议改用模式 2（DNS API 申请）。"
             return 1
@@ -331,7 +331,6 @@ show_cert_status() {
         active_cert=$(jq -r '.inbounds[]? | .streamSettings.tlsSettings.certificates[0].certificateFile // empty' "$XRAY_CONFIG" 2>/dev/null | head -n1 || true)
     fi
     [ -z "$active_cert" ] && [ -f "$CERT_FILE" ] && active_cert="$CERT_FILE"
-    [ -z "$active_cert" ] && [ -f "/root/ygkkkca/cert.crt" ] && active_cert="/root/ygkkkca/cert.crt"
 
     if [ -n "$active_cert" ] && [ -f "$active_cert" ]; then
         echo -e "  当前证书路径 : ${CYAN}${active_cert}${PLAIN}"

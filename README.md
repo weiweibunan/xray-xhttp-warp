@@ -72,7 +72,7 @@ flowchart TD
    - 原生模式 100% 使用 Cloudflare 官方 `cloudflare-warp` 与官方 `XTLS/Xray-core`。
    - 隧道模式在 Debian/Ubuntu Systemd 环境优先使用官方 `cloudflare-warp` 获取凭据；在精简容器/无 D-Bus 环境下自动改用 `xray wg` + Cloudflare 官方注册接口获取真实独立凭据。
 2. **多模式智能适配与集成证书申请**：
-   - **原生 VPS 模式**：双栈监听 (443/8443)，具备 CDN 优选、TCP 直连与 H3/QUIC 三种节点；并**可选附加开启 Cloudflare Tunnel 隧道入栈**（新增第 4 个隧道优选节点，`cloudflared -> 127.0.0.1` 免证书内网回源，支持随时通过 `xm tunnel` 动态开关）。**内置集成官方 `acmesh-official/acme.sh`**：支持 80 端口域名证书、Cloudflare/DNSPod/阿里云 DNS API（单域名与泛域名，无需开 80 端口、可全程保留 CF 小黄云）、以及 IP 短期证书，并配置自动续期重载 Xray；同时自动兼容读取 `/etc/xray/cert/` 与旧版 `/root/ygkkkca/` 已有证书。
+   - **原生 VPS 模式**：双栈监听 (443/8443)，具备 CDN 优选、TCP 直连与 H3/QUIC 三种节点；并**可选附加开启 Cloudflare Tunnel 隧道入栈**（新增第 4 个隧道优选节点，`cloudflared -> 127.0.0.1` 免证书内网回源，支持随时通过 `xm tunnel` 动态开关）。**内置集成官方 `acmesh-official/acme.sh`**：支持 80 端口域名证书、Cloudflare/DNSPod/阿里云 DNS API（单域名与泛域名，无需开 80 端口、可全程保留 CF 小黄云）、以及 IP 短期证书，并配置自动续期重载 Xray；默认读取 `/etc/xray/cert/` 证书，也支持通过环境变量指定已有证书路径。
    - **容器/NAT 穿透模式**：专为无开放端口、无 Systemd 的容器/轻量沙箱（如 Altare、Docker、PRoot）量身定制，通过 `EnvironmentFile` 安全传递 Tunnel Token，免证书、免开公网端口。
 3. **严格 IPv6 AI 分流与安全隔离**：
    - 解决痛点：WARP 的 IPv4 段被 OpenAI / Gemini 严格风控，而 WARP 的 **IPv6 段信誉极佳**。
@@ -124,7 +124,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/weiweibunan/xray-xhttp-warp/
 | `xm cert` | 证书管理（`xm cert status` 查看、`xm cert issue` 申请/更换并应用、`xm cert renew` 强制续期） |
 | `xm bbr` | 一键开启/检查系统 TCP BBR 拥塞控制加速 |
 | `xm update-core` | 比对版本并校验 SHA256 升级 Xray 官方最新核心 |
-| `xm update-geo` | 校验 SHA256 原子升级 `geosite.dat` / `geoip.dat` 规则库 |
+| `xm update-geo` | 从 [Loyalsoldier/v2ray-rules-dat](https://github.com/Loyalsoldier/v2ray-rules-dat) 校验 SHA256 增量升级 `geosite.dat` / `geoip.dat` |
+| `xm geo-cron` | 设置/查看/关闭规则库定时自动更新（`daily` / `weekly` / `days <N>` / `off`） |
 | `xm test` | 校验 `/etc/xray/config.json` 语法正确性 |
 | `xm uninstall` | 彻底卸载服务与清理配置 |
 

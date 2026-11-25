@@ -4,6 +4,8 @@
 # 单文件自包含，自动适配 Systemd 与无 Systemd 容器/沙箱环境
 # ==============================================================================
 
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
 RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
@@ -18,6 +20,11 @@ CONFIG="/etc/xray/config.json"
 TUNNEL_CONF="/etc/xray/tunnel.conf"
 TUNNEL_ENV="/etc/xray/tunnel.env"
 CDN_HOST="www.shopify.com"
+GEO_REPO_URL="https://github.com/Loyalsoldier/v2ray-rules-dat"
+GEO_TIMER="/etc/systemd/system/xray-geo-update.timer"
+GEO_SERVICE="/etc/systemd/system/xray-geo-update.service"
+GEO_LOG="/var/log/xray-geo-update.log"
+GEO_CRON_TAG="# xray-xhttp-warp-geo-update"
 
 if [ "${EUID:-$(id -u)}" -ne 0 ]; then
     echo -e "${RED}❌ 请使用 root 权限执行此命令！${PLAIN}"
@@ -34,6 +41,33 @@ read_tty() {
 
 is_systemd() {
     [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1 && [ "$(ps -p 1 -o comm= 2>/dev/null)" = "systemd" ]
+}
+
+is_proc_alive() {
+    local target="$1"
+    if ps -eo stat=,comm= >/dev/null 2>&1; then
+        ps -eo stat=,comm= 2>/dev/null | awk -v t="$target" '$1 !~ /^Z/ && $2 == t {found=1} END{exit !found}'
+        return $?
+    fi
+    pgrep -x "$target" >/dev/null 2>&1
+}
+
+first_live_pid() {
+    local target="$1"
+    if ps -eo pid=,stat=,comm= >/dev/null 2>&1; then
+        ps -eo pid=,stat=,comm= 2>/dev/null | awk -v t="$target" '$2 !~ /^Z/ && $3 == t {print $1; exit}'
+        return 0
+    fi
+    pgrep -x "$target" 2>/dev/null | head -n1
+}
+
+list_live_procs() {
+    local target="$1"
+    if ps -eo pid=,stat=,comm=,args= >/dev/null 2>&1; then
+        ps -eo pid=,stat=,comm=,args= 2>/dev/null | awk -v t="$target" '$2 !~ /^Z/ && $3 == t {pid=$1; $1=$2=$3=""; sub(/^[[:space:]]+/, ""); print pid, $0}'
+        return 0
+    fi
+    pgrep -a -x "$target" 2>/dev/null || true
 }
 
 # 安全加载隧道元配置（避免从旧配置遗留问题直接执行任意代码）
@@ -187,8 +221,8 @@ show_info() {
         [ "$x_act" = "active" ] && x_status="${GREEN}运行中 (active)${PLAIN}" || x_status="${RED}未运行 ($x_act)${PLAIN}"
         [ "$cf_act" = "active" ] && cf_status="${GREEN}运行中 (active)${PLAIN}" || cf_status="${RED}未运行 ($cf_act)${PLAIN}"
     else
-        pgrep -x xray >/dev/null 2>&1 && x_status="${GREEN}运行中 (PID: $(pgrep -x xray | head -n1))${PLAIN}" || x_status="${RED}未运行${PLAIN}"
-        pgrep -x cloudflared >/dev/null 2>&1 && cf_status="${GREEN}运行中 (PID: $(pgrep -x cloudflared | head -n1))${PLAIN}" || cf_status="${RED}未运行${PLAIN}"
+        is_proc_alive xray && x_status="${GREEN}运行中 (PID: $(first_live_pid xray))${PLAIN}" || x_status="${RED}未运行${PLAIN}"
+        is_proc_alive cloudflared && cf_status="${GREEN}运行中 (PID: $(first_live_pid cloudflared))${PLAIN}" || cf_status="${RED}未运行${PLAIN}"
     fi
 
     # ---------------- 容器/隧道穿透模式 ----------------
@@ -236,7 +270,7 @@ show_info() {
     local cert_file ip sni node_addr path_h3 path_xc port_h3 port_xc
     cert_file=$(get_inbound_field "xhttp-cdn-443-in" "cert")
     if [ -z "$cert_file" ]; then
-        [ -f "/etc/xray/cert/cert.crt" ] && cert_file="/etc/xray/cert/cert.crt" || cert_file="/root/ygkkkca/cert.crt"
+        [ -f "/etc/xray/cert/cert.crt" ] && cert_file="/etc/xray/cert/cert.crt"
     fi
     ip=$(fetch_public_ip)
     sni=$(extract_sni_from_cert "$cert_file")
@@ -305,8 +339,19 @@ start_cloudflared_container() {
         chmod 600 "$TUNNEL_ENV"
     fi
     if [ -f "$TUNNEL_ENV" ]; then
-        ( set -a; . "$TUNNEL_ENV"; exec "$CF_BIN" tunnel --no-autoupdate --loglevel warn run ) >/var/log/cloudflared.log 2>&1 &
+        ( set -a; . "$TUNNEL_ENV"; exec nohup "$CF_BIN" tunnel --no-autoupdate --loglevel warn run ) >/var/log/cloudflared.log 2>&1 &
     fi
+}
+
+stop_proc_graceful() {
+    local proc_name="$1" i
+    pkill -x "$proc_name" 2>/dev/null || true
+    for i in $(seq 1 25); do
+        is_proc_alive "$proc_name" || return 0
+        sleep 0.2
+    done
+    pkill -9 -x "$proc_name" 2>/dev/null || true
+    sleep 0.2
 }
 
 start_xray() {
@@ -315,10 +360,10 @@ start_xray() {
         systemctl start xray
         is_tunnel_active && systemctl start cloudflared
     else
-        if ! pgrep -x xray >/dev/null 2>&1; then
+        if ! is_proc_alive xray; then
             XRAY_LOCATION_ASSET="$XRAY_ASSET_DIR" nohup "$XRAY_BIN" run -c "$CONFIG" >/var/log/xray.log 2>&1 &
         fi
-        if is_tunnel_active && ! pgrep -x cloudflared >/dev/null 2>&1; then
+        if is_tunnel_active && ! is_proc_alive cloudflared; then
             start_cloudflared_container
         fi
     fi
@@ -331,8 +376,8 @@ stop_xray() {
         systemctl stop xray 2>/dev/null || true
         is_tunnel_active && systemctl stop cloudflared 2>/dev/null || true
     else
-        pkill -x xray 2>/dev/null || true
-        pkill -x cloudflared 2>/dev/null || true
+        stop_proc_graceful xray
+        stop_proc_graceful cloudflared
     fi
     echo -e "${YELLOW}⏸️ 服务已停止！${PLAIN}"
 }
@@ -348,9 +393,8 @@ restart_xray() {
         systemctl restart xray
         is_tunnel_active && systemctl restart cloudflared 2>/dev/null || true
     else
-        pkill -x xray 2>/dev/null || true
-        pkill -x cloudflared 2>/dev/null || true
-        sleep 1
+        stop_proc_graceful xray
+        stop_proc_graceful cloudflared
         XRAY_LOCATION_ASSET="$XRAY_ASSET_DIR" nohup "$XRAY_BIN" run -c "$CONFIG" >/var/log/xray.log 2>&1 &
         is_tunnel_active && start_cloudflared_container
     fi
@@ -368,10 +412,21 @@ status_xray() {
         fi
     else
         echo -e "${CYAN}>>> 进程运行状态 (容器环境):${PLAIN}"
-        pgrep -a -x xray 2>/dev/null || echo "xray 未运行"
-        is_tunnel_active && { pgrep -a -x cloudflared 2>/dev/null || echo "cloudflared 未运行"; }
+        local live_x live_cf
+        live_x=$(list_live_procs xray)
+        [ -n "$live_x" ] && echo "$live_x" || echo "xray 未运行"
+        if is_tunnel_active; then
+            live_cf=$(list_live_procs cloudflared)
+            [ -n "$live_cf" ] && echo "$live_cf" || echo "cloudflared 未运行"
+        fi
         echo -e "\n${CYAN}>>> 本地监听端口:${PLAIN}"
-        ss -tulnp 2>/dev/null | grep -E 'xray|cloudflared' || netstat -tulnp 2>/dev/null | grep -E 'xray|cloudflared' || true
+        if command -v ss >/dev/null 2>&1; then
+            ss -tulnp 2>/dev/null | grep -E 'xray|cloudflared' || true
+        elif command -v netstat >/dev/null 2>&1; then
+            netstat -tulnp 2>/dev/null | grep -E 'xray|cloudflared' || true
+        else
+            echo "未检测到 ss / netstat 工具（跳过端口展示）"
+        fi
     fi
 }
 
@@ -529,7 +584,7 @@ is_tcp_port_occupied_by_other() {
         line=$(netstat -tlnp 2>/dev/null | grep -E ":${port}[[:space:]]" || true)
     fi
     [ -z "$line" ] && return 1
-    echo "$line" | grep -q "xray" && return 1
+    echo "$line" | grep -qE '"xray"|[0-9]+/xray' && return 1
     echo "$line"
     return 0
 }
@@ -640,8 +695,7 @@ update_tunnel_token() {
         systemctl enable cloudflared 2>/dev/null || true
         systemctl restart cloudflared
     else
-        pkill -x cloudflared 2>/dev/null || true
-        sleep 1
+        stop_proc_graceful cloudflared
         start_cloudflared_container
     fi
 
@@ -714,7 +768,9 @@ manage_native_tunnel() {
                     systemctl status cloudflared --no-pager || true
                 else
                     echo -e "\n${CYAN}>>> cloudflared 进程状态:${PLAIN}"
-                    pgrep -a -x cloudflared 2>/dev/null || echo "cloudflared 未运行"
+                    local live_cf_st
+                    live_cf_st=$(list_live_procs cloudflared)
+                    [ -n "$live_cf_st" ] && echo "$live_cf_st" || echo "cloudflared 未运行"
                 fi
             else
                 echo -e "  附加隧道状态  : ${YELLOW}未启用${PLAIN}"
@@ -820,7 +876,7 @@ manage_native_tunnel() {
                 rm -f /etc/systemd/system/cloudflared.service
                 systemctl daemon-reload
             else
-                pkill -x cloudflared 2>/dev/null || true
+                stop_proc_graceful cloudflared
             fi
 
             if command -v jq >/dev/null 2>&1; then
@@ -903,20 +959,31 @@ upgrade_core() {
 }
 
 upgrade_geo() {
-    echo -e "${CYAN}>>> 正在安全升级 geosite.dat 与 geoip.dat 规则库...${PLAIN}"
+    echo -e "${CYAN}>>> 正在安全检查并升级 geosite.dat 与 geoip.dat 规则库...${PLAIN}"
+    echo -e "  规则来源 : ${CYAN}${GEO_REPO_URL}${PLAIN}"
     mkdir -p "$XRAY_ASSET_DIR"
-    local file tmp_dir tmp_file sum_file expected actual size
+    local file tmp_dir tmp_file sum_file expected cur_sha actual size
+    local updated=0
     for file in geosite.dat geoip.dat; do
         tmp_dir=$(mktemp -d)
         tmp_file="${tmp_dir}/${file}"
         sum_file="${tmp_dir}/${file}.sha256sum"
         expected=""
-        local gh_url="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/${file}"
+        local gh_url="${GEO_REPO_URL}/releases/latest/download/${file}"
         local cdn_url="https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/${file}"
 
         if curl -fsSL --connect-timeout 10 "${gh_url}.sha256sum" -o "$sum_file" 2>/dev/null || \
            curl -fsSL --connect-timeout 10 "${cdn_url}.sha256sum" -o "$sum_file" 2>/dev/null; then
             expected=$(awk '{print tolower($1)}' "$sum_file" | tr -d ' \r\n')
+        fi
+
+        if [ -s "${XRAY_ASSET_DIR}/${file}" ] && [ -n "$expected" ]; then
+            cur_sha=$(compute_sha256 "${XRAY_ASSET_DIR}/${file}")
+            if [ -n "$cur_sha" ] && [ "$cur_sha" = "$expected" ]; then
+                rm -rf "$tmp_dir"
+                echo -e "${GREEN}✅ ${file} 已是最新版本 (SHA256 一致)，跳过下载。${PLAIN}"
+                continue
+            fi
         fi
 
         if ! curl -fsSL --connect-timeout 15 --retry 3 "$gh_url" -o "$tmp_file" && \
@@ -946,10 +1013,345 @@ upgrade_geo() {
         chmod 644 "${XRAY_ASSET_DIR}/${file}"
         rm -f "/usr/local/bin/${file}" "/etc/xray/${file}"
         rm -rf "$tmp_dir"
+        updated=1
     done
 
-    restart_xray
-    echo -e "${GREEN}✅ 规则库更新成功！geosite 大小：$(ls -lh "${XRAY_ASSET_DIR}/geosite.dat" | awk '{print $5}')${PLAIN}"
+    if [ "$updated" -eq 1 ]; then
+        [ -f "$CONFIG" ] && restart_xray
+        echo -e "${GREEN}✅ 规则库更新成功！geosite: $(ls -lh "${XRAY_ASSET_DIR}/geosite.dat" 2>/dev/null | awk '{print $5}') | geoip: $(ls -lh "${XRAY_ASSET_DIR}/geoip.dat" 2>/dev/null | awk '{print $5}')${PLAIN}"
+    else
+        echo -e "${GREEN}✅ geosite.dat 与 geoip.dat 均已是最新版本，无需重启 Xray！${PLAIN}"
+    fi
+}
+
+geo_cron_status_str() {
+    if is_systemd; then
+        if [ -f "$GEO_TIMER" ] && systemctl is-enabled --quiet xray-geo-update.timer 2>/dev/null; then
+            local cal
+            cal=$(grep -E '^OnCalendar=' "$GEO_TIMER" 2>/dev/null | head -n1 | cut -d'=' -f2-)
+            echo "已开启 (Systemd Timer: ${cal:-默认})"
+            return 0
+        fi
+    else
+        if command -v crontab >/dev/null 2>&1; then
+            local line
+            line=$(crontab -l 2>/dev/null | grep -F "$GEO_CRON_TAG" | head -n1 || true)
+            if [ -n "$line" ]; then
+                local sched
+                sched=$(echo "$line" | awk '{print $1, $2, $3, $4, $5}')
+                echo "已开启 (Cron: ${sched})"
+                return 0
+            fi
+        fi
+    fi
+    echo "未开启"
+}
+
+convert_cron_to_oncalendar() {
+    local expr="$1" m h dom mon dow mm hh day
+    read -r m h dom mon dow <<< "$expr"
+    [[ "$m" =~ ^[0-9]+$ ]] && [ "$m" -ge 0 ] && [ "$m" -le 59 ] || return 1
+    [[ "$h" =~ ^[0-9]+$ ]] && [ "$h" -ge 0 ] && [ "$h" -le 23 ] || return 1
+    [ "$mon" = "*" ] || return 1
+    mm=$(printf '%02d' "$((10#$m))")
+    hh=$(printf '%02d' "$((10#$h))")
+    if [ "$dom" = "*" ] && [ "$dow" = "*" ]; then
+        echo "*-*-* ${hh}:${mm}:00"
+        return 0
+    elif [[ "$dom" =~ ^\*/([0-9]+)$ ]] && [ "$dow" = "*" ]; then
+        echo "*-*-1/${BASH_REMATCH[1]} ${hh}:${mm}:00"
+        return 0
+    elif [ "$dom" = "*" ] && [[ "$dow" =~ ^[0-7]$ ]]; then
+        case "$dow" in
+            0|7) day="Sun" ;; 1) day="Mon" ;; 2) day="Tue" ;; 3) day="Wed" ;;
+            4) day="Thu" ;; 5) day="Fri" ;; 6) day="Sat" ;;
+        esac
+        echo "${day} *-*-* ${hh}:${mm}:00"
+        return 0
+    fi
+    return 1
+}
+
+apply_geo_schedule() {
+    local on_cal="$1"
+    local cron_expr="$2"
+    local desc="${3:-$on_cal}"
+
+    if is_systemd; then
+        if command -v systemd-analyze >/dev/null 2>&1; then
+            if ! systemd-analyze calendar "$on_cal" >/dev/null 2>&1; then
+                echo -e "${RED}❌ 无效的 Systemd OnCalendar 时间表达式: ${on_cal}${PLAIN}"
+                echo -e "${YELLOW}💡 示例: '*-*-* 04:00:00' (每天04:00) 或 'Mon *-*-* 04:00:00' (每周一04:00)${PLAIN}"
+                return 1
+            fi
+        fi
+        cat > "$GEO_SERVICE" << SERVICE
+[Unit]
+Description=Xray Geosite & GeoIP Auto-Update (Loyalsoldier/v2ray-rules-dat)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/xm update-geo
+SERVICE
+        cat > "$GEO_TIMER" << TIMER
+[Unit]
+Description=Scheduled Xray Geosite & GeoIP Auto-Update Timer
+
+[Timer]
+OnCalendar=${on_cal}
+RandomizedDelaySec=900
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+TIMER
+        systemctl daemon-reload
+        systemctl enable --now xray-geo-update.timer
+        echo -e "${GREEN}✅ 已开启规则库定时自动更新: ${desc} (OnCalendar: ${on_cal})${PLAIN}"
+        systemctl list-timers xray-geo-update.timer --no-pager 2>/dev/null || true
+    else
+        if [ -z "$cron_expr" ]; then
+            echo -e "${RED}❌ 容器环境仅支持标准 5 段 Cron 表达式 (如 '0 4 * * *' 或 '0 4 * * 1')！${PLAIN}"
+            return 1
+        fi
+        if ! command -v crontab >/dev/null 2>&1; then
+            echo -e "${CYAN}>>> 正在安装 cron 以支持容器内定时更新...${PLAIN}"
+            if command -v apt-get >/dev/null 2>&1; then
+                DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null 2>&1 && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cron >/dev/null 2>&1 || true
+            elif command -v apk >/dev/null 2>&1; then
+                apk add --no-cache dcron >/dev/null 2>&1 || true
+            elif command -v dnf >/dev/null 2>&1; then
+                dnf install -y cronie >/dev/null 2>&1 || true
+            elif command -v yum >/dev/null 2>&1; then
+                yum install -y cronie >/dev/null 2>&1 || true
+            fi
+        fi
+        if ! command -v crontab >/dev/null 2>&1; then
+            echo -e "${RED}❌ 当前环境缺少 crontab，无法配置定时任务！${PLAIN}"
+            return 1
+        fi
+        local existing
+        existing=$(crontab -l 2>/dev/null | grep -vF "$GEO_CRON_TAG" || true)
+        {
+            [ -n "$existing" ] && printf '%s\n' "$existing"
+            echo "${cron_expr} /usr/local/bin/xm update-geo >> ${GEO_LOG} 2>&1 ${GEO_CRON_TAG}"
+        } | crontab -
+        pgrep -x cron >/dev/null 2>&1 || pgrep -x crond >/dev/null 2>&1 || cron >/dev/null 2>&1 || crond >/dev/null 2>&1 || true
+        echo -e "${GREEN}✅ 已设置规则库 Crontab 定时更新: ${desc} (${cron_expr})${PLAIN}"
+        echo -e "  💡 请注意无 Systemd 容器内需确保 cron/crond 后台运行。"
+    fi
+}
+
+disable_geo_schedule() {
+    local quiet="${1:-0}"
+    if is_systemd; then
+        systemctl stop xray-geo-update.timer 2>/dev/null || true
+        systemctl disable xray-geo-update.timer 2>/dev/null || true
+        if [ -f "$GEO_TIMER" ] || [ -f "$GEO_SERVICE" ]; then
+            rm -f "$GEO_TIMER" "$GEO_SERVICE"
+            systemctl daemon-reload 2>/dev/null || true
+        fi
+    fi
+    if command -v crontab >/dev/null 2>&1; then
+        local existing
+        existing=$(crontab -l 2>/dev/null || true)
+        if echo "$existing" | grep -qF "$GEO_CRON_TAG"; then
+            local filtered
+            filtered=$(echo "$existing" | grep -vF "$GEO_CRON_TAG" || true)
+            if [ -n "$filtered" ]; then
+                printf '%s\n' "$filtered" | crontab -
+            else
+                crontab -r 2>/dev/null || true
+            fi
+        fi
+    fi
+    [ "$quiet" != "1" ] && echo -e "${YELLOW}⏸️ 已关闭 geosite/geoip 规则库定时自动更新！${PLAIN}"
+    return 0
+}
+
+geo_status_view() {
+    echo -e "${BLUE}==================================================${PLAIN}"
+    echo -e "${GREEN}        geosite / geoip 规则库状态信息            ${PLAIN}"
+    echo -e "${BLUE}==================================================${PLAIN}"
+    echo -e "  规则来源     : ${CYAN}${GEO_REPO_URL}${PLAIN}"
+    echo -e "  定时更新状态 : ${CYAN}$(geo_cron_status_str)${PLAIN}"
+    local f
+    for f in geosite.dat geoip.dat; do
+        if [ -f "${XRAY_ASSET_DIR}/${f}" ]; then
+            local sz dt sha
+            sz=$(ls -lh "${XRAY_ASSET_DIR}/${f}" | awk '{print $5}')
+            dt=$(date -r "${XRAY_ASSET_DIR}/${f}" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || stat -c '%y' "${XRAY_ASSET_DIR}/${f}" 2>/dev/null | cut -d'.' -f1)
+            sha=$(compute_sha256 "${XRAY_ASSET_DIR}/${f}" | cut -c1-12)
+            echo -e "  ${f}  : ${GREEN}${sz}${PLAIN} (更新于 ${dt}, sha256:${sha}...)"
+        else
+            echo -e "  ${f}  : ${RED}未安装${PLAIN}"
+        fi
+    done
+    if is_systemd && [ -f "$GEO_TIMER" ]; then
+        echo -e "\n${CYAN}>>> Systemd 定时器详情:${PLAIN}"
+        systemctl list-timers xray-geo-update.timer --no-pager 2>/dev/null || true
+        echo -e "\n${CYAN}>>> 最近一次自动更新日志:${PLAIN}"
+        journalctl -u xray-geo-update -n 10 --no-pager 2>/dev/null || true
+    elif [ -f "$GEO_LOG" ]; then
+        echo -e "\n${CYAN}>>> 最近自动更新日志 (${GEO_LOG}):${PLAIN}"
+        tail -n 10 "$GEO_LOG" 2>/dev/null || true
+    fi
+    echo -e "${BLUE}==================================================${PLAIN}"
+}
+
+set_geo_schedule_cli() {
+    local mode="${1:-}"
+    local arg2="${2:-}"
+    local arg3="${3:-}"
+
+    if [ -z "$mode" ]; then
+        echo -e "${BLUE}==================================================${PLAIN}"
+        echo -e "${GREEN}      设置 geosite/geoip 规则库定时自动更新       ${PLAIN}"
+        echo -e "      当前状态: ${CYAN}$(geo_cron_status_str)${PLAIN}"
+        echo -e "${BLUE}==================================================${PLAIN}"
+        echo -e " ${GREEN}1.${PLAIN} 每天自动更新 (默认 04:00)"
+        echo -e " ${GREEN}2.${PLAIN} 每周自动更新 (默认每周一 04:00) [推荐]"
+        echo -e " ${GREEN}3.${PLAIN} 每 N 天自动更新 (自定义天数 1-30 与小时)"
+        echo -e " ${GREEN}4.${PLAIN} 自定义 Cron / OnCalendar 表达式"
+        echo -e " ${RED}5.${PLAIN} 关闭定时自动更新"
+        echo -e " ${YELLOW}0.${PLAIN} 返回"
+        echo -e "${BLUE}==================================================${PLAIN}"
+        local c h d expr
+        read_tty -p "请输入选项 [0-5]: " c || return 1
+        case "$c" in
+            1)
+                read_tty -p "请输入每日执行小时 [0-23, 默认 4]: " h || return 1
+                set_geo_schedule_cli daily "${h:-4}"
+                ;;
+            2)
+                read_tty -p "请输入每周一执行小时 [0-23, 默认 4]: " h || return 1
+                set_geo_schedule_cli weekly "${h:-4}"
+                ;;
+            3)
+                read_tty -p "请输入更新间隔天数 [1-30, 默认 3]: " d || return 1
+                read_tty -p "请输入执行小时 [0-23, 默认 4]: " h || return 1
+                set_geo_schedule_cli days "${d:-3}" "${h:-4}"
+                ;;
+            4)
+                echo -e "${YELLOW}示例: 5段Cron '0 4 * * *' / '30 3 * * 1'，或 Systemd OnCalendar '*-*-* 04:00:00'${PLAIN}"
+                read_tty -p "请输入表达式: " expr || return 1
+                set_geo_schedule_cli custom "$expr"
+                ;;
+            5) disable_geo_schedule ;;
+            0) return 0 ;;
+            *) echo -e "${RED}输入无效！${PLAIN}"; return 1 ;;
+        esac
+        return $?
+    fi
+
+    local hh
+    case "$mode" in
+        status)
+            geo_status_view
+            ;;
+        off|disable|stop)
+            disable_geo_schedule
+            ;;
+        daily)
+            local hour="${arg2:-4}"
+            if [[ ! "$hour" =~ ^[0-9]+$ ]] || [ "$hour" -lt 0 ] || [ "$hour" -gt 23 ]; then
+                echo -e "${RED}❌ 小时必须是 0-23 之间的整数！${PLAIN}"; return 1
+            fi
+            hh=$(printf '%02d' "$((10#$hour))")
+            apply_geo_schedule "*-*-* ${hh}:00:00" "0 ${hour} * * *" "每天 ${hh}:00"
+            ;;
+        weekly)
+            local hour="${arg2:-4}"
+            if [[ ! "$hour" =~ ^[0-9]+$ ]] || [ "$hour" -lt 0 ] || [ "$hour" -gt 23 ]; then
+                echo -e "${RED}❌ 小时必须是 0-23 之间的整数！${PLAIN}"; return 1
+            fi
+            hh=$(printf '%02d' "$((10#$hour))")
+            apply_geo_schedule "Mon *-*-* ${hh}:00:00" "0 ${hour} * * 1" "每周一 ${hh}:00"
+            ;;
+        days)
+            local days="${arg2:-3}"
+            local hour="${arg3:-4}"
+            if [[ ! "$days" =~ ^[0-9]+$ ]] || [ "$days" -lt 1 ] || [ "$days" -gt 30 ]; then
+                echo -e "${RED}❌ 天数必须是 1-30 之间的整数！${PLAIN}"; return 1
+            fi
+            if [[ ! "$hour" =~ ^[0-9]+$ ]] || [ "$hour" -lt 0 ] || [ "$hour" -gt 23 ]; then
+                echo -e "${RED}❌ 小时必须是 0-23 之间的整数！${PLAIN}"; return 1
+            fi
+            hh=$(printf '%02d' "$((10#$hour))")
+            if [ "$days" -eq 1 ]; then
+                apply_geo_schedule "*-*-* ${hh}:00:00" "0 ${hour} * * *" "每天 ${hh}:00"
+            else
+                apply_geo_schedule "*-*-1/${days} ${hh}:00:00" "0 ${hour} */${days} * *" "每 ${days} 天 ${hh}:00"
+            fi
+            ;;
+        custom)
+            local expr="${arg2:-}"
+            [ -z "$expr" ] && { echo -e "${RED}❌ 表达式不能为空！${PLAIN}"; return 1; }
+            local nf
+            nf=$(echo "$expr" | awk '{print NF}')
+            if [ "$nf" -eq 5 ] && [[ "$expr" =~ ^[0-9*/,-]+[[:space:]] ]]; then
+                if is_systemd; then
+                    local converted
+                    if converted=$(convert_cron_to_oncalendar "$expr"); then
+                        apply_geo_schedule "$converted" "$expr" "自定义 (${expr})"
+                    else
+                        echo -e "${RED}❌ Systemd 仅支持简单 5 段 Cron 自动转换，复杂周期请直接传 OnCalendar 表达式 (如 'Mon,Thu *-*-* 04:30:00')！${PLAIN}"
+                        return 1
+                    fi
+                else
+                    apply_geo_schedule "" "$expr" "自定义 (${expr})"
+                fi
+            else
+                if is_systemd; then
+                    apply_geo_schedule "$expr" "" "自定义 (${expr})"
+                else
+                    echo -e "${RED}❌ 容器环境不支持 Systemd OnCalendar 格式，请输入 5 段 Cron (如 '0 4 * * *')！${PLAIN}"
+                    return 1
+                fi
+            fi
+            ;;
+        *)
+            echo "用法: xm geo-cron [daily [小时]|weekly [小时]|days <1-30> [小时]|custom <表达式>|status|off]"
+            return 1
+            ;;
+    esac
+}
+
+manage_geo() {
+    local sub="${1:-}"
+    if [ -z "$sub" ]; then
+        echo -e "${BLUE}==================================================${PLAIN}"
+        echo -e "${GREEN}      geosite / geoip 规则库更新与定时管理        ${PLAIN}"
+        echo -e "      规则来源: ${CYAN}${GEO_REPO_URL}${PLAIN}"
+        echo -e "      定时状态: ${CYAN}$(geo_cron_status_str)${PLAIN}"
+        echo -e "${BLUE}==================================================${PLAIN}"
+        echo -e " ${GREEN}1.${PLAIN} 立即检查并更新规则库 (update-geo)"
+        echo -e " ${GREEN}2.${PLAIN} 设置 / 修改定时自动更新 (geo-cron)"
+        echo -e " ${GREEN}3.${PLAIN} 查看规则库版本与定时器日志 (status)"
+        echo -e " ${RED}4.${PLAIN} 关闭定时自动更新 (off)"
+        echo -e " ${YELLOW}0.${PLAIN} 返回"
+        echo -e "${BLUE}==================================================${PLAIN}"
+        local c
+        read_tty -p "请输入选项 [0-4]: " c || return 1
+        case "$c" in
+            1) upgrade_geo ;;
+            2) set_geo_schedule_cli ;;
+            3) geo_status_view ;;
+            4) disable_geo_schedule ;;
+            0) return 0 ;;
+            *) echo -e "${RED}输入无效！${PLAIN}"; return 1 ;;
+        esac
+        return $?
+    fi
+    case "$sub" in
+        update|now) upgrade_geo ;;
+        cron|schedule|timer) set_geo_schedule_cli "${2:-}" "${3:-}" "${4:-}" ;;
+        status) geo_status_view ;;
+        off|disable) disable_geo_schedule ;;
+        *) echo "用法: xm geo [update|cron|status|off]"; return 1 ;;
+    esac
 }
 
 test_config() {
@@ -1018,6 +1420,7 @@ uninstall_xray() {
     fi
 
     stop_xray
+    disable_geo_schedule 1
     pkill -x xray 2>/dev/null || true
     pkill -x cloudflared 2>/dev/null || true
     if is_systemd; then
@@ -1030,7 +1433,7 @@ uninstall_xray() {
     rm -rf /etc/xray /usr/local/share/xray
     rm -f /usr/local/bin/xray /usr/local/bin/cloudflared \
           /usr/local/bin/xm /usr/bin/xm /usr/local/bin/xinfo \
-          /var/log/xray.log /var/log/cloudflared.log
+          /var/log/xray.log /var/log/cloudflared.log "$GEO_LOG"
     echo -e "${GREEN}✅ 服务及管理组件已彻底清理卸载干净！${PLAIN}"
     [ "${1:-}" = "--yes" ] || exit 0
 }
@@ -1039,7 +1442,6 @@ cert_show_status() {
     local active_cert=""
     [ -f "$CONFIG" ] && active_cert=$(get_inbound_field "xhttp-cdn-443-in" "cert")
     [ -z "$active_cert" ] && [ -f "/etc/xray/cert/cert.crt" ] && active_cert="/etc/xray/cert/cert.crt"
-    [ -z "$active_cert" ] && [ -f "/root/ygkkkca/cert.crt" ] && active_cert="/root/ygkkkca/cert.crt"
 
     echo -e "${BLUE}==================================================${PLAIN}"
     echo -e "${GREEN}              SSL 证书状态检查                    ${PLAIN}"
@@ -1178,7 +1580,7 @@ menu() {
             echo -e " ${GREEN}8.${PLAIN} 管理 Cloudflare Tunnel 附加隧道 (tunnel) ${YELLOW}[未开启]${PLAIN}"
         fi
         echo -e " ${GREEN}9.${PLAIN} 升级 Xray 官方最新内核 (update-core)"
-        echo -e " ${GREEN}10.${PLAIN} 升级 geosite/geoip 规则库 (update-geo)"
+        echo -e " ${GREEN}10.${PLAIN} 管理与定时更新 geosite/geoip 规则库 (geo / geo-cron)"
         echo -e " ${GREEN}11.${PLAIN} 校验配置文件语法 (test)"
         echo -e " ${GREEN}12.${PLAIN} 开启/检查系统 BBR 加速 (bbr)"
         echo -e " ${GREEN}13.${PLAIN} 切换 Xray 日志级别 (loglevel)"
@@ -1204,7 +1606,7 @@ menu() {
                 fi
                 ;;
             9) upgrade_core ;;
-            10) upgrade_geo ;;
+            10) manage_geo ;;
             11) test_config ;;
             12) enable_bbr ;;
             13) set_loglevel ;;
@@ -1232,6 +1634,8 @@ case "${1:-}" in
     cert) manage_cert "${2:-}" ;;
     update-core) upgrade_core ;;
     update-geo) upgrade_geo ;;
+    geo) manage_geo "${2:-}" "${3:-}" "${4:-}" ;;
+    geo-cron) set_geo_schedule_cli "${2:-}" "${3:-}" "${4:-}" ;;
     test) test_config ;;
     bbr) enable_bbr ;;
     uninstall|del) uninstall_xray "${2:-}" ;;

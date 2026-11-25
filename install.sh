@@ -151,12 +151,14 @@ uninstall_all() {
     rm -f /etc/systemd/system/warp-proxy-autoconnect.service \
           /etc/systemd/system/xray.service \
           /etc/systemd/system/cloudflared.service \
+          /etc/systemd/system/xray-geo-update.service \
+          /etc/systemd/system/xray-geo-update.timer \
           /etc/apt/sources.list.d/cloudflare-client.list \
           /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg \
           /usr/local/bin/warp /usr/bin/warp \
           /usr/local/bin/xm /usr/bin/xm /usr/local/bin/xinfo \
           /usr/local/bin/xray /usr/local/bin/cloudflared \
-          /var/log/xray.log /var/log/cloudflared.log
+          /var/log/xray.log /var/log/cloudflared.log /var/log/xray-geo-update.log
     rm -rf /etc/xray /usr/local/share/xray /var/lib/cloudflare-warp
     is_systemd && systemctl daemon-reload 2>/dev/null || true
 
