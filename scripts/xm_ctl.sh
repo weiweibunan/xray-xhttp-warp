@@ -1598,7 +1598,7 @@ warp_menu() {
         echo -e " ${GREEN}7.${PLAIN} 修改 SOCKS5 监听端口并同步 Xray (port)"
         echo -e " ${GREEN}8.${PLAIN} 开关开机自动连接服务 (autostart)"
         echo -e " ${GREEN}9.${PLAIN} 查看 warp-svc 实时/最近日志 (logs)"
-        echo -e " ${GREEN}10.${PLAIN} 无 GUI 精简升级 official cloudflare-warp (update)"
+        echo -e " ${GREEN}10.${PLAIN} 无 GUI 精简升级官方 cloudflare-warp (update)"
         echo -e " ${YELLOW}11.${PLAIN} 重新注册 WARP 客户端 (register)"
         echo -e " ${YELLOW}0.${PLAIN} 返回"
         echo -e "${BLUE}==================================================${PLAIN}"
@@ -1655,8 +1655,38 @@ manage_warp() {
 
     case "$sub" in
         help|-h|--help) warp_print_help ;;
-        register) "$cli" --accept-tos registration new ;;
-        unregister) "$cli" --accept-tos registration delete ;;
+        register)
+            local cur_port
+            cur_port=$(warp_detect_socks_port "" "$cli")
+            if "$cli" --accept-tos registration show >/dev/null 2>&1; then
+                echo -e "${CYAN}>>> 检测到已有 WARP 注册信息，正在注销旧设备并重新注册...${PLAIN}"
+                "$cli" --accept-tos disconnect >/dev/null 2>&1 || true
+                if ! "$cli" --accept-tos registration delete; then
+                    echo -e "${RED}❌ 注销旧 WARP 注册信息失败！${PLAIN}"
+                    return 1
+                fi
+            fi
+            if ! "$cli" --accept-tos registration new; then
+                echo -e "${RED}❌ 注册新 WARP 设备失败！${PLAIN}"
+                return 1
+            fi
+            "$cli" --accept-tos tunnel protocol set MASQUE >/dev/null 2>&1 || true
+            "$cli" --accept-tos mode proxy >/dev/null 2>&1 || true
+            "$cli" --accept-tos proxy port "$cur_port" >/dev/null 2>&1 || true
+            "$cli" --accept-tos connect >/dev/null 2>&1 || true
+            for _i in $(seq 1 8); do
+                if "$cli" --accept-tos status 2>/dev/null | grep -qi "Connected"; then
+                    break
+                fi
+                sleep 1
+            done
+            echo -e "${GREEN}✅ WARP 已重新注册并恢复 SOCKS5 代理 (127.0.0.1:${cur_port})！${PLAIN}"
+            "$cli" --accept-tos status || true
+            ;;
+        unregister)
+            "$cli" --accept-tos disconnect >/dev/null 2>&1 || true
+            "$cli" --accept-tos registration delete
+            ;;
         start|connect) "$cli" --accept-tos connect ;;
         stop|disconnect) "$cli" --accept-tos disconnect ;;
         restart)
