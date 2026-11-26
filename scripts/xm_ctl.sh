@@ -27,7 +27,16 @@ GEO_LOG="/var/log/xray-geo-update.log"
 GEO_CRON_TAG="# xray-xhttp-warp-geo-update"
 
 if [ "${EUID:-$(id -u)}" -ne 0 ]; then
-    echo -e "${RED}❌ 请使用 root 权限执行此命令！${PLAIN}"
+    if command -v sudo >/dev/null 2>&1 && [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ] && [[ "${BASH_SOURCE[0]}" != /dev/fd/* ]] && [[ "${BASH_SOURCE[0]}" != /proc/*/fd/* ]]; then
+        echo ">>> 检测到当前为非 root 用户 ($(id -un))，正在通过 sudo 自动提权..." >&2
+        _ELEVATE_ENV=()
+        for _v in REPO_URL CERT_PATH KEY_PATH CF_TOKEN CF_DOMAIN LOCAL_PORT; do
+            [ "${!_v+set}" = "set" ] && _ELEVATE_ENV+=("${_v}=${!_v}")
+        done
+        _SELF_ABS=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
+        exec sudo env "${_ELEVATE_ENV[@]}" bash "$_SELF_ABS" "$@"
+    fi
+    echo -e "${RED}❌ 请使用 root 权限执行此命令！（提示：非 root 用户请先执行 'sudo -i' 或使用 sudo 运行）${PLAIN}" >&2
     exit 1
 fi
 

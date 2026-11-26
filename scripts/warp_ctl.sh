@@ -4,6 +4,8 @@
 # 单文件自包含
 # ==============================================================================
 
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
+_WARP_ARGS=("$@")
 CLI=$(command -v warp-cli || true)
 
 if [ -z "$CLI" ]; then
@@ -13,7 +15,17 @@ fi
 
 require_root() {
     if [ "${EUID:-$(id -u)}" -ne 0 ]; then
-        echo "❌ 此操作需要 root 权限，请使用 sudo 或 root 执行！"
+        if command -v sudo >/dev/null 2>&1 && [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ] && [[ "${BASH_SOURCE[0]}" != /dev/fd/* ]] && [[ "${BASH_SOURCE[0]}" != /proc/*/fd/* ]]; then
+            echo ">>> 此操作需要 root 权限，正在通过 sudo 自动提权..." >&2
+            local -a elevate_env=()
+            local _v _self_abs
+            for _v in REPO_URL; do
+                [ "${!_v+set}" = "set" ] && elevate_env+=("${_v}=${!_v}")
+            done
+            _self_abs=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
+            exec sudo env "${elevate_env[@]}" bash "$_self_abs" "${_WARP_ARGS[@]}"
+        fi
+        echo "❌ 此操作需要 root 权限，请使用 sudo 或 root 执行！" >&2
         exit 1
     fi
 }
