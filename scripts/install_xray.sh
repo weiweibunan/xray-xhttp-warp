@@ -373,8 +373,8 @@ fi
 open_firewall_port tcp "$PORT_XC"
 open_firewall_port udp "$PORT_H3"
 
-# 安装 xm 管理命令并建立全局软链接
-install_ctl_script "xm_ctl.sh" "/usr/local/bin/xm" "/usr/bin/xm" "$SCRIPT_DIR"
+# 安装 xm 统一管理命令并建立全局软链接（含 warp 兼容入口）
+install_unified_xm_ctl "$SCRIPT_DIR"
 
 # 打印节点信息
 if [ -x /usr/local/bin/xm ]; then

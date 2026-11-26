@@ -104,8 +104,8 @@ systemctl daemon-reload
 systemctl enable warp-proxy-autoconnect.service
 systemctl restart warp-proxy-autoconnect.service
 
-# 安装管理命令并建立全局软链接
-install_ctl_script "warp_ctl.sh" "/usr/local/bin/warp" "/usr/bin/warp" "$SCRIPT_DIR"
+# 安装统一管理命令 xm（含 warp 兼容软链接）
+install_unified_xm_ctl "$SCRIPT_DIR"
 
 log_ok ">>> [WARP 5/5] 验证 SOCKS5 (127.0.0.1:40000) 连通性..."
 WARP_V4_OK=false
@@ -130,8 +130,8 @@ if [ "$WARP_V6_OK" = "true" ] || [ "$WARP_V4_OK" = "true" ]; then
     echo -e "隧道协议 : ${PROTO_ACTUAL}"
     echo -e "IPv4出口 : $([ "$WARP_V4_OK" = "true" ] && echo "${GREEN}正常 (warp=on)${PLAIN}" || echo "${YELLOW}暂未通${PLAIN}")"
     echo -e "IPv6出口 : $([ "$WARP_V6_OK" = "true" ] && echo "${GREEN}正常 (warp=on)${PLAIN}" || echo "${YELLOW}暂未通${PLAIN}")"
-    echo -e "状态指令 : warp status  | 测试指令: warp test"
+    echo -e "管理指令 : xm warp status | 测试指令: xm warp test (兼容 warp test)"
     echo -e "${GREEN}==================================================${PLAIN}"
 else
-    log_warn "⚠️ WARP 已配置并启动，当前测试暂时超时，请稍后执行 'warp test' 验证。"
+    log_warn "⚠️ WARP 已配置并启动，当前测试暂时超时，请稍后执行 'xm warp test' 验证。"
 fi

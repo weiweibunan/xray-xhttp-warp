@@ -503,6 +503,13 @@ install_ctl_script() {
     fi
 }
 
+install_unified_xm_ctl() {
+    local caller_dir="${1:-}"
+    install_ctl_script "xm_ctl.sh" "/usr/local/bin/xm" "/usr/bin/xm" "$caller_dir" || return 1
+    ln -sf "/usr/local/bin/xm" "/usr/local/bin/warp" 2>/dev/null || true
+    ln -sf "/usr/local/bin/xm" "/usr/bin/warp" 2>/dev/null || true
+}
+
 cleanup_autostart_hooks() {
     local rc tmp_rc
     for rc in /root/.bashrc /etc/profile; do
@@ -806,7 +813,7 @@ install_cloudflare_warp_headless() {
         return 1
     fi
 
-    # 锁定包版本，防止 apt upgrade 重新拉取带 GUI 依赖的上游包；升级请使用 'warp update'
+    # 锁定包版本，防止 apt upgrade 重新拉取带 GUI 依赖的上游包；升级请使用 'xm warp update'
     apt-mark hold cloudflare-warp >/dev/null 2>&1 || true
 
     # 安装后校验保留二进制的动态链接库完整性，防止未来新版新增核心库时漏判

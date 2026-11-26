@@ -109,11 +109,13 @@ bash <(curl -fsSL https://raw.githubusercontent.com/weiweibunan/xray-xhttp-warp/
 
 ## 快捷管理命令
 
-### 1. Xray 管理器 (`xm`)
+> 💡 所有管理功能已统一整合进 **`xm`** 控制台与命令行；原 `warp` 命令作为兼容软链接保留（`warp test` 等价于 `xm warp test`）。非 root 普通用户直接执行时会自动按需 `sudo` 提权。
+
+### 1. Xray 统一管理器 (`xm`)
 
 | 命令 | 说明 |
 | :--- | :--- |
-| `xm` | 打开交互式管理控制台菜单 |
+| `xm` | 打开交互式管理控制台菜单（含第 15 项 WARP 管理、第 16 项一键更新脚本） |
 | `xm info` | 查看节点配置与一键 `vless://` 分享链接 |
 | `xm restart` | 安全测试配置并重启服务 |
 | `xm status` | 查看 Xray 及隧道运行状态 |
@@ -127,20 +129,22 @@ bash <(curl -fsSL https://raw.githubusercontent.com/weiweibunan/xray-xhttp-warp/
 | `xm update-core` | 比对版本并校验 SHA256 升级 Xray 官方最新核心 |
 | `xm update-geo` | 从 [Loyalsoldier/v2ray-rules-dat](https://github.com/Loyalsoldier/v2ray-rules-dat) 校验 SHA256 增量升级 `geosite.dat` / `geoip.dat` |
 | `xm geo-cron` | 设置/查看/关闭规则库定时自动更新（`daily` / `weekly` / `days <N>` / `off`） |
+| `xm update-script` | 从 GitHub 在线更新 `xm`（含 `warp` 兼容入口）管理脚本自身，不影响运行中配置 |
 | `xm test` | 校验 `/etc/xray/config.json` 语法正确性 |
 | `xm uninstall` | 彻底卸载服务与清理配置 |
 
-### 2. WARP 管理器 (`warp`)
+### 2. 集成 WARP 子命令 (`xm warp` / 兼容 `warp`)
 
 | 命令 | 说明 |
 | :--- | :--- |
-| `warp` | 显示 WARP 管理帮助菜单 |
-| `warp status` | 查看当前连接状态与接入点 |
-| `warp test [端口]` | 测试本地 SOCKS5 代理的 IPv4 与 IPv6 双栈 WARP 出口状态 |
-| `warp restart` | 重启官方 WARP 隧道连接 |
-| `warp register` | 重新向 Cloudflare 注册客户端 |
-| `warp logs` | 查看 WARP 官方后台日志 |
-| `warp update` | 以无 GUI 精简方式升级官方 `cloudflare-warp` 客户端包 |
+| `xm warp` | 打开交互式 WARP 管理菜单（兼容命令 `warp` 打印 CLI 用法） |
+| `xm warp status` | 查看当前连接状态与接入点（兼容 `warp status`） |
+| `xm warp test [端口]` | 测试本地 SOCKS5 代理的 IPv4 与 IPv6 双栈 WARP 出口状态（兼容 `warp test`） |
+| `xm warp restart` | 重启官方 WARP 隧道连接（兼容 `warp restart`） |
+| `xm warp port <端口>` | 修改 WARP SOCKS5 监听端口并同步更新 `/etc/xray/config.json` |
+| `xm warp register` | 重新向 Cloudflare 注册客户端 |
+| `xm warp logs [行数]` | 查看 WARP 官方后台日志 |
+| `xm warp update` | 以无 GUI 白名单精简方式升级官方 `cloudflare-warp` 客户端包（兼容 `warp update`） |
 
 ---
 
@@ -170,8 +174,8 @@ xray-xhttp-warp/
 │   ├── install_tunnel.sh              # 容器/NAT穿透模式自动化安装脚本
 │   ├── install_warp.sh                # Cloudflare 官方 WARP SOCKS5 自动化安装脚本
 │   ├── install_xray.sh                # Xray 原生双节点 + ForceIPv6 分流主装机脚本
-│   ├── warp_ctl.sh                    # /usr/local/bin/warp 管理工具（单文件自包含）
-│   └── xm_ctl.sh                      # /usr/local/bin/xm 统一管理工具（单文件自包含）
+│   ├── warp_ctl.sh                    # warp 命令兼容入口包装脚本（转发至 xm warp）
+│   └── xm_ctl.sh                      # /usr/local/bin/xm 统一管理工具（单文件自包含，集成 warp）
 ├── systemd/
 │   ├── cloudflared.service            # Cloudflare Tunnel 官方服务配置（EnvironmentFile 模式）
 │   ├── warp-proxy-autoconnect.service # WARP 开机自动连接服务

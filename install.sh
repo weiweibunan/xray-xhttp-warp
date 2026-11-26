@@ -85,8 +85,7 @@ get_subscript() {
 }
 
 ensure_ctl() {
-    install_ctl_script "xm_ctl.sh" "/usr/local/bin/xm" "/usr/bin/xm" "$SCRIPT_DIR" || true
-    install_ctl_script "warp_ctl.sh" "/usr/local/bin/warp" "/usr/bin/warp" "$SCRIPT_DIR" || true
+    install_unified_xm_ctl "$SCRIPT_DIR" || true
 }
 
 preflight_xray_cert() {
@@ -147,8 +146,8 @@ install_all() {
     echo -e "\n${GREEN}==================================================${PLAIN}"
     echo -e "${GREEN}🎉 全套系统已成功就绪！${PLAIN}"
     echo -e "  - BBR 加速状态 : $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '未知')"
-    echo -e "  - WARP 管理命令: ${CYAN}warp${PLAIN} (测试: warp test)"
-    echo -e "  - Xray 管理命令: ${CYAN}xm${PLAIN}   (节点: xm info | BBR: xm bbr)"
+    echo -e "  - WARP 管理命令: ${CYAN}xm warp${PLAIN} (测试: xm warp test | 仍兼容 warp 命令)"
+    echo -e "  - 综合管理控制台: ${CYAN}xm${PLAIN} (节点: xm info | 升级脚本: xm update-script)"
     echo -e "${GREEN}==================================================${PLAIN}"
 }
 

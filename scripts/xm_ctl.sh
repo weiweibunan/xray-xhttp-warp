@@ -4,7 +4,9 @@
 # 单文件自包含，自动适配 Systemd 与无 Systemd 容器/沙箱环境
 # ==============================================================================
 
-export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
+_XM_ARGS=("$@")
+_CALLER_NAME=$(basename "$0")
 
 RED="\033[31m"
 GREEN="\033[32m"
@@ -26,7 +28,18 @@ GEO_SERVICE="/etc/systemd/system/xray-geo-update.service"
 GEO_LOG="/var/log/xray-geo-update.log"
 GEO_CRON_TAG="# xray-xhttp-warp-geo-update"
 
-if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+_NEEDS_ROOT=1
+if [ "$_CALLER_NAME" = "warp" ]; then
+    case "${1:-}" in
+        ""|help|-h|--help|status|info|test|logs) _NEEDS_ROOT=0 ;;
+    esac
+elif [ "${1:-}" = "warp" ]; then
+    case "${2:-}" in
+        help|-h|--help|status|info|test|logs) _NEEDS_ROOT=0 ;;
+    esac
+fi
+
+if [ "$_NEEDS_ROOT" -eq 1 ] && [ "${EUID:-$(id -u)}" -ne 0 ]; then
     if command -v sudo >/dev/null 2>&1 && [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ] && [[ "${BASH_SOURCE[0]}" != /dev/fd/* ]] && [[ "${BASH_SOURCE[0]}" != /proc/*/fd/* ]]; then
         echo ">>> 检测到当前为非 root 用户 ($(id -un))，正在通过 sudo 自动提权..." >&2
         _ELEVATE_ENV=()
@@ -34,7 +47,7 @@ if [ "${EUID:-$(id -u)}" -ne 0 ]; then
             [ "${!_v+set}" = "set" ] && _ELEVATE_ENV+=("${_v}=${!_v}")
         done
         _SELF_ABS=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
-        exec sudo env "${_ELEVATE_ENV[@]}" bash "$_SELF_ABS" "$@"
+        exec sudo env "${_ELEVATE_ENV[@]}" bash "$_SELF_ABS" "${_XM_ARGS[@]}"
     fi
     echo -e "${RED}❌ 请使用 root 权限执行此命令！（提示：非 root 用户请先执行 'sudo -i' 或使用 sudo 运行）${PLAIN}" >&2
     exit 1
@@ -1454,8 +1467,287 @@ uninstall_xray() {
     rm -f /usr/local/bin/xray /usr/local/bin/cloudflared \
           /usr/local/bin/xm /usr/bin/xm /usr/local/bin/xinfo \
           /var/log/xray.log /var/log/cloudflared.log "$GEO_LOG"
+    [ -L /usr/local/bin/warp ] && [ ! -e /usr/local/bin/warp ] && rm -f /usr/local/bin/warp
+    [ -L /usr/bin/warp ] && [ ! -e /usr/bin/warp ] && rm -f /usr/bin/warp
     echo -e "${GREEN}✅ 服务及管理组件已彻底清理卸载干净！${PLAIN}"
     [ "${1:-}" = "--yes" ] || exit 0
+}
+
+warp_print_help() {
+    echo "=================================================="
+    echo "       Cloudflare WARP 管理 (已集成至 xm warp)    "
+    echo "=================================================="
+    echo "xm warp               打开交互式 WARP 管理菜单"
+    echo "xm warp status        查看当前连接状态 (兼容 warp status)"
+    echo "xm warp test [端口]   测试 IPv4 & IPv6 出口 (兼容 warp test)"
+    echo "xm warp info          查看注册信息与设备 ID"
+    echo "xm warp start         启动连接 (connect)"
+    echo "xm warp stop          断开连接 (disconnect)"
+    echo "xm warp restart       重启连接"
+    echo "xm warp port 40000    修改 SOCKS5 端口并同步 Xray 配置"
+    echo "xm warp register      注册 WARP 客户端"
+    echo "xm warp unregister    注销当前注册设备"
+    echo "xm warp autostart on|off  开关开机自动连接服务"
+    echo "xm warp logs [行数]   查看 warp-svc 后台日志"
+    echo "xm warp update        无 GUI 精简升级官方 cloudflare-warp"
+    echo "=================================================="
+}
+
+warp_detect_socks_port() {
+    local custom="${1:-}" cli="${2:-}"
+    if [ -n "$custom" ]; then
+        echo "$custom"
+        return 0
+    fi
+    local port=""
+    if [ -n "$cli" ]; then
+        port=$("$cli" --accept-tos settings 2>/dev/null | grep -iE 'proxy port|local proxy port' | grep -oE '[0-9]+' | tail -n1 || true)
+    fi
+    if [ -z "$port" ] && [ -f "$CONFIG" ]; then
+        port=$(grep -A6 '"socks-warp"' "$CONFIG" 2>/dev/null | grep -oE '"port"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | head -n1 || true)
+    fi
+    echo "${port:-40000}"
+}
+
+warp_sync_xray_socks_port() {
+    local new_port="$1"
+    [ -f "$CONFIG" ] || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+    jq -e '.outbounds[]? | select(.tag == "socks-warp")' "$CONFIG" >/dev/null 2>&1 || return 0
+
+    local tmp_dir tmp_cfg
+    tmp_dir=$(mktemp -d)
+    tmp_cfg="${tmp_dir}/config.json"
+    jq --argjson p "$new_port" '
+        .outbounds |= map(if .tag == "socks-warp" and (.settings.servers | length) > 0 then .settings.servers[0].port = $p else . end)
+    ' "$CONFIG" > "$tmp_cfg"
+    if XRAY_LOCATION_ASSET="$XRAY_ASSET_DIR" "$XRAY_BIN" run -test -c "$tmp_cfg" >/dev/null 2>&1; then
+        chmod 644 "$tmp_cfg"
+        mv -f "$tmp_cfg" "$CONFIG"
+        rm -rf "$tmp_dir"
+        restart_xray
+        echo -e "${GREEN}✅ 已同步更新 Xray socks-warp 出站端口为 ${new_port} 并重载服务。${PLAIN}"
+    else
+        rm -rf "$tmp_dir"
+        echo -e "${YELLOW}⚠️ 同步更新 $CONFIG 失败，请手动检查端口配置。${PLAIN}"
+    fi
+}
+
+warp_upgrade_pkg() {
+    local cli="$1"
+    if ! command -v apt-get >/dev/null 2>&1; then
+        echo -e "${RED}❌ 当前系统不支持 apt-get 更新！${PLAIN}"
+        return 1
+    fi
+    local repo_url="${REPO_URL:-https://raw.githubusercontent.com/weiweibunan/xray-xhttp-warp/main}"
+    local script_dir tmp_common="" rc=0
+    script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+    if [ -f "${script_dir}/common.sh" ]; then
+        . "${script_dir}/common.sh"
+    elif [ -f "${script_dir}/scripts/common.sh" ]; then
+        . "${script_dir}/scripts/common.sh"
+    else
+        tmp_common=$(mktemp /tmp/xm-warp-common.XXXXXX.sh)
+        if ! curl -fsSL --connect-timeout 15 --retry 3 "${repo_url}/scripts/common.sh" -o "$tmp_common"; then
+            rm -f "$tmp_common"
+            echo -e "${RED}❌ 下载公共函数库 scripts/common.sh 失败！${PLAIN}"
+            return 1
+        fi
+        . "$tmp_common"
+    fi
+    setup_cloudflare_warp_repo && install_cloudflare_warp_headless || rc=$?
+    [ -n "$tmp_common" ] && rm -f "$tmp_common"
+    [ "$rc" -eq 0 ] || return "$rc"
+
+    systemctl restart warp-svc 2>/dev/null || true
+    for _i in $(seq 1 15); do
+        "$cli" --accept-tos status >/dev/null 2>&1 && break
+        sleep 1
+    done
+    "$cli" --accept-tos connect 2>/dev/null || true
+}
+
+warp_show_container_wireguard() {
+    echo -e "${BLUE}==================================================${PLAIN}"
+    echo -e "${GREEN}    WARP 内置 WireGuard 出站状态 (容器/穿透模式)  ${PLAIN}"
+    echo -e "${BLUE}==================================================${PLAIN}"
+    echo -e "  运行方式 : ${CYAN}Xray 内置 WireGuard (ForceIPv6)${PLAIN} — 未依赖 warp-svc"
+    if [ -f /etc/xray/warp-tunnel.json ] && command -v jq >/dev/null 2>&1; then
+        echo -e "  WARP IPv6: ${CYAN}$(jq -r '.v6 // "未知"' /etc/xray/warp-tunnel.json 2>/dev/null)${PLAIN}"
+        echo -e "  Endpoint : ${CYAN}$(jq -r '.endpoint_v4 // .endpoint_v6 // "未知"' /etc/xray/warp-tunnel.json 2>/dev/null)${PLAIN}"
+    elif [ -f "$CONFIG" ] && command -v jq >/dev/null 2>&1; then
+        echo -e "  Endpoint : ${CYAN}$(jq -r '.outbounds[]? | select(.tag=="warp-ipv6-out") | .settings.peers[0].endpoint // "未知"' "$CONFIG" 2>/dev/null)${PLAIN}"
+    fi
+    echo -e "  分流规则 : ${GREEN}geosite:openai, geosite:google-deepmind -> warp-ipv6-out${PLAIN}"
+    echo -e "${BLUE}==================================================${PLAIN}"
+}
+
+warp_menu() {
+    local cli="$1"
+    while true; do
+        echo -e "${BLUE}==================================================${PLAIN}"
+        echo -e "${GREEN}        Cloudflare 官方 WARP SOCKS5 管理          ${PLAIN}"
+        echo -e "        当前状态: ${CYAN}$("$cli" --accept-tos status 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g' || echo '未知')${PLAIN}"
+        echo -e "${BLUE}==================================================${PLAIN}"
+        echo -e " ${GREEN}1.${PLAIN} 查看连接状态 (status)"
+        echo -e " ${GREEN}2.${PLAIN} 测试 IPv4 & IPv6 双栈出口 (test)"
+        echo -e " ${GREEN}3.${PLAIN} 启动 / 连接 WARP (start)"
+        echo -e " ${GREEN}4.${PLAIN} 断开 WARP 连接 (stop)"
+        echo -e " ${GREEN}5.${PLAIN} 重启 WARP 连接 (restart)"
+        echo -e " ${GREEN}6.${PLAIN} 查看注册信息与设备 ID (info)"
+        echo -e " ${GREEN}7.${PLAIN} 修改 SOCKS5 监听端口并同步 Xray (port)"
+        echo -e " ${GREEN}8.${PLAIN} 开关开机自动连接服务 (autostart)"
+        echo -e " ${GREEN}9.${PLAIN} 查看 warp-svc 实时/最近日志 (logs)"
+        echo -e " ${GREEN}10.${PLAIN} 无 GUI 精简升级 official cloudflare-warp (update)"
+        echo -e " ${YELLOW}11.${PLAIN} 重新注册 WARP 客户端 (register)"
+        echo -e " ${YELLOW}0.${PLAIN} 返回"
+        echo -e "${BLUE}==================================================${PLAIN}"
+        local wc
+        read_tty -p "请输入选项 [0-11]: " wc || return 0
+        case "$wc" in
+            1) manage_warp status ;;
+            2) manage_warp test ;;
+            3) manage_warp start ;;
+            4) manage_warp stop ;;
+            5) manage_warp restart ;;
+            6) manage_warp info ;;
+            7)
+                local np
+                read_tty -p "请输入新 SOCKS5 监听端口 [1-65535，默认 40000]: " np || continue
+                [ -z "$np" ] && np="40000"
+                manage_warp port "$np"
+                ;;
+            8)
+                local as
+                read_tty -p "开启还是关闭开机自启？(on/off): " as || continue
+                manage_warp autostart "$as"
+                ;;
+            9) manage_warp logs 50 ;;
+            10) manage_warp update ;;
+            11) manage_warp register ;;
+            0) return 0 ;;
+            *) echo -e "${RED}输入无效！${PLAIN}" ;;
+        esac
+        echo ""
+        read_tty -p "按回车键继续..." _wpause || break
+    done
+}
+
+manage_warp() {
+    local sub="${1:-}"
+    local cli
+    cli=$(command -v warp-cli || true)
+
+    if [ -z "$cli" ]; then
+        load_tunnel_meta
+        if [ "$TUNNEL_MODE" = "1" ] || [ -f /etc/xray/warp-tunnel.json ]; then
+            warp_show_container_wireguard
+            return 0
+        fi
+        echo -e "${RED}❌ 未检测到 warp-cli 客户端，请先安装 WARP (bash install.sh warp)！${PLAIN}"
+        return 1
+    fi
+
+    if [ -z "$sub" ]; then
+        warp_menu "$cli"
+        return $?
+    fi
+
+    case "$sub" in
+        help|-h|--help) warp_print_help ;;
+        register) "$cli" --accept-tos registration new ;;
+        unregister) "$cli" --accept-tos registration delete ;;
+        start|connect) "$cli" --accept-tos connect ;;
+        stop|disconnect) "$cli" --accept-tos disconnect ;;
+        restart)
+            "$cli" --accept-tos disconnect || true
+            sleep 1
+            "$cli" --accept-tos connect
+            ;;
+        status) "$cli" --accept-tos status ;;
+        info) "$cli" --accept-tos registration show ;;
+        port)
+            local target_port="${2:-}"
+            if [ -z "$target_port" ] || [[ ! "$target_port" =~ ^[0-9]+$ ]] || [ "$target_port" -lt 1 ] || [ "$target_port" -gt 65535 ]; then
+                echo "用法: xm warp port <1-65535> (例如: xm warp port 40000)"
+                return 1
+            fi
+            "$cli" --accept-tos proxy port "$target_port"
+            warp_sync_xray_socks_port "$target_port"
+            ;;
+        test)
+            local port
+            port=$(warp_detect_socks_port "${2:-}" "$cli")
+            echo -e "${CYAN}>>> 正在通过 SOCKS5 代理 (127.0.0.1:${port}) 测试 Cloudflare 双栈连通性与 WARP 出口...${PLAIN}"
+            echo "--- IPv4 检测 ---"
+            curl -fsS --connect-timeout 5 --max-time 10 -x "socks5h://127.0.0.1:${port}" https://1.1.1.1/cdn-cgi/trace | grep -E '^(ip|loc|warp)=' || echo "IPv4 检测超时或未通"
+            echo "--- IPv6 检测 (AI 分流核心通道) ---"
+            curl -fsS --connect-timeout 5 --max-time 10 -x "socks5h://127.0.0.1:${port}" "https://[2606:4700:4700::1111]/cdn-cgi/trace" | grep -E '^(ip|loc|warp)=' || echo "IPv6 检测超时或未通"
+            ;;
+        autostart)
+            case "${2:-}" in
+                on)
+                    systemctl enable --now warp-proxy-autoconnect.service
+                    echo -e "${GREEN}✅ WARP 开机自启动已开启！${PLAIN}"
+                    ;;
+                off)
+                    systemctl disable --now warp-proxy-autoconnect.service
+                    echo -e "${YELLOW}⏸️ WARP 开机自启动已关闭！${PLAIN}"
+                    ;;
+                *)
+                    echo "用法: xm warp autostart on|off"
+                    return 1
+                    ;;
+            esac
+            ;;
+        logs)
+            if command -v journalctl >/dev/null 2>&1 && is_systemd; then
+                journalctl -u warp-svc -n "${2:-100}" --no-pager
+            else
+                echo -e "${RED}❌ 当前环境未运行 Systemd，无法查看 journalctl 日志。${PLAIN}"
+                return 1
+            fi
+            ;;
+        update)
+            warp_upgrade_pkg "$cli"
+            ;;
+        *)
+            warp_print_help
+            return 1
+            ;;
+    esac
+}
+
+update_xm_script() {
+    local from_menu="${1:-0}"
+    local repo_url="${REPO_URL:-https://raw.githubusercontent.com/weiweibunan/xray-xhttp-warp/main}"
+    local tmp_xm
+    tmp_xm=$(mktemp /tmp/xm-update.XXXXXX.sh)
+
+    echo -e "${CYAN}>>> 正在从 GitHub 拉取最新版管理脚本 (${repo_url}/scripts/xm_ctl.sh)...${PLAIN}"
+    if ! curl -fsSL --connect-timeout 15 --retry 3 "${repo_url}/scripts/xm_ctl.sh" -o "$tmp_xm"; then
+        rm -f "$tmp_xm"
+        echo -e "${RED}❌ 下载最新版脚本失败，请检查网络连接！${PLAIN}"
+        return 1
+    fi
+    if ! bash -n "$tmp_xm" 2>/dev/null || ! grep -q "Xray 统一综合管理控制台" "$tmp_xm"; then
+        rm -f "$tmp_xm"
+        echo -e "${RED}❌ 下载的文件校验无效，已放弃覆盖！${PLAIN}"
+        return 1
+    fi
+
+    chmod 755 "$tmp_xm"
+    mkdir -p /usr/local/bin
+    mv -f "$tmp_xm" /usr/local/bin/xm
+    ln -sf /usr/local/bin/xm /usr/bin/xm 2>/dev/null || true
+    ln -sf /usr/local/bin/xm /usr/local/bin/warp 2>/dev/null || true
+    ln -sf /usr/local/bin/xm /usr/bin/warp 2>/dev/null || true
+
+    echo -e "${GREEN}✅ xm 管理脚本已更新到最新版！（已同步整合 warp 命令入口，节点与运行配置保持不变）${PLAIN}"
+    if [ "$from_menu" = "1" ]; then
+        sleep 1
+        exec /usr/local/bin/xm
+    fi
 }
 
 cert_show_status() {
@@ -1576,7 +1868,9 @@ menu() {
         clear 2>/dev/null || true
         echo -e "${BLUE}==================================================${PLAIN}"
         echo -e "${GREEN}       Xray 统一综合管理控制台 (/usr/local/bin/xm)${PLAIN}"
-        if [ "$TUNNEL_MODE" = "1" ]; then
+        if [ ! -f "$CONFIG" ] && command -v warp-cli >/dev/null 2>&1; then
+            echo -e "       当前模式: ${CYAN}仅 Cloudflare WARP 客户端${PLAIN}"
+        elif [ "$TUNNEL_MODE" = "1" ]; then
             echo -e "       当前模式: ${CYAN}容器/NAT 穿透模式 (Cloudflare Tunnel)${PLAIN}"
         elif [ "$CF_TUNNEL_ENABLED" = "1" ]; then
             echo -e "       当前模式: ${CYAN}标准原生 VPS + CF 隧道双模式${PLAIN}"
@@ -1605,11 +1899,19 @@ menu() {
         echo -e " ${GREEN}12.${PLAIN} 开启/检查系统 BBR 加速 (bbr)"
         echo -e " ${GREEN}13.${PLAIN} 切换 Xray 日志级别 (loglevel)"
         echo -e " ${GREEN}14.${PLAIN} SSL 证书申请/查看/续期 (cert)"
+        if command -v warp-cli >/dev/null 2>&1; then
+            echo -e " ${GREEN}15.${PLAIN} 管理 Cloudflare WARP 客户端 (warp)"
+        elif [ "$TUNNEL_MODE" = "1" ] || [ -f /etc/xray/warp-tunnel.json ]; then
+            echo -e " ${GREEN}15.${PLAIN} 查看 WARP 内置 WireGuard 状态 (warp)"
+        else
+            echo -e " ${GREEN}15.${PLAIN} 管理 Cloudflare WARP 客户端 (warp) ${YELLOW}[未安装]${PLAIN}"
+        fi
+        echo -e " ${GREEN}16.${PLAIN} 更新 xm 管理脚本到最新版 (update-script)"
         echo -e "--------------------------------------------------"
-        echo -e " ${RED}15.${PLAIN} 彻底卸载清理组件 (uninstall)"
+        echo -e " ${RED}17.${PLAIN} 彻底卸载清理组件 (uninstall)"
         echo -e " ${YELLOW}0.${PLAIN} 退出菜单"
         echo -e "${BLUE}==================================================${PLAIN}"
-        read_tty -p "请输入选项 [0-15]: " choice
+        read_tty -p "请输入选项 [0-17]: " choice
         case "$choice" in
             1) show_info ;;
             2) start_xray ;;
@@ -1631,7 +1933,9 @@ menu() {
             12) enable_bbr ;;
             13) set_loglevel ;;
             14) manage_cert ;;
-            15) uninstall_xray ;;
+            15) manage_warp ;;
+            16) update_xm_script 1 ;;
+            17) uninstall_xray ;;
             0) exit 0 ;;
             *) echo -e "${RED}输入无效，请重新输入！${PLAIN}" ;;
         esac
@@ -1639,6 +1943,15 @@ menu() {
         read_tty -p "按回车键返回主菜单..." _pause || break
     done
 }
+
+if [ "$_CALLER_NAME" = "warp" ]; then
+    if [ "$#" -eq 0 ]; then
+        warp_print_help
+    else
+        manage_warp "$@"
+    fi
+    exit $?
+fi
 
 case "${1:-}" in
     info) show_info ;;
@@ -1652,8 +1965,10 @@ case "${1:-}" in
     token) update_tunnel_token ;;
     tunnel) manage_native_tunnel "${2:-}" "${3:-}" ;;
     cert) manage_cert "${2:-}" ;;
+    warp) shift; manage_warp "$@" ;;
     update-core) upgrade_core ;;
     update-geo) upgrade_geo ;;
+    update-script|self-update|upgrade-script) update_xm_script 0 ;;
     geo) manage_geo "${2:-}" "${3:-}" "${4:-}" ;;
     geo-cron) set_geo_schedule_cli "${2:-}" "${3:-}" "${4:-}" ;;
     test) test_config ;;

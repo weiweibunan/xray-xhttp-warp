@@ -491,8 +491,8 @@ fi
     [ -f /etc/profile ] && echo "$AUTORUN_CODE" >> /etc/profile
 fi
 
-# 安装 xm 管理命令并展示节点信息
-install_ctl_script "xm_ctl.sh" "/usr/local/bin/xm" "/usr/bin/xm" "$SCRIPT_DIR"
+# 安装 xm 统一管理命令（含 warp 兼容入口）并展示节点信息
+install_unified_xm_ctl "$SCRIPT_DIR"
 sleep 2
 if [ -x /usr/local/bin/xm ]; then
     /usr/local/bin/xm info
