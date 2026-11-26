@@ -130,28 +130,9 @@ try_warp_official_cli() {
 
     local warp_dir="/var/lib/cloudflare-warp"
     if ! command -v warp-cli >/dev/null 2>&1; then
-        log_info "安装官方 Cloudflare WARP 客户端以获取原生 WireGuard 密钥..."
-        install_pkg gnupg >/dev/null 2>&1 || return 1
-        mkdir -p /usr/share/keyrings
-        local tmp_gpg
-        tmp_gpg=$(mktemp)
-        if ! fetch_to_file "$tmp_gpg" "https://pkg.cloudflareclient.com/pubkey.gpg"; then
-            rm -f "$tmp_gpg"
-            return 1
-        fi
-        gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg < "$tmp_gpg" 2>/dev/null || { rm -f "$tmp_gpg"; return 1; }
-        rm -f "$tmp_gpg"
-        . /etc/os-release 2>/dev/null || true
-        local codename="${VERSION_CODENAME:-bookworm}"
-        if ! curl -fsI --connect-timeout 5 "https://pkg.cloudflareclient.com/dists/${codename}/Release" >/dev/null 2>&1; then
-            if [ "${ID:-}" = "ubuntu" ] || [[ "${ID_LIKE:-}" == *ubuntu* ]]; then
-                codename="noble"
-            else
-                codename="bookworm"
-            fi
-        fi
-        echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${codename} main" > /etc/apt/sources.list.d/cloudflare-client.list
-        install_pkg cloudflare-warp >/dev/null 2>&1 || return 1
+        log_info "安装官方 Cloudflare WARP 无 GUI 客户端以获取原生 WireGuard 密钥..."
+        setup_cloudflare_warp_repo >/dev/null 2>&1 || return 1
+        install_cloudflare_warp_headless >/dev/null 2>&1 || return 1
     fi
 
     local was_active=false

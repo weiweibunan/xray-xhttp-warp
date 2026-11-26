@@ -143,6 +143,7 @@ uninstall_all() {
     pkill -x cloudflared 2>/dev/null || true
     pkill -x warp-svc 2>/dev/null || true
     if command -v apt-get >/dev/null 2>&1; then
+        command -v apt-mark >/dev/null 2>&1 && apt-mark unhold cloudflare-warp >/dev/null 2>&1 || true
         DEBIAN_FRONTEND=noninteractive apt-get purge -y cloudflare-warp 2>/dev/null || true
         DEBIAN_FRONTEND=noninteractive apt-get autoremove -y 2>/dev/null || true
     fi

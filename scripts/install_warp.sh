@@ -41,31 +41,13 @@ if ! command -v apt-get >/dev/null 2>&1; then
 fi
 
 log_ok ">>> [WARP 1/5] 安装必要基础依赖..."
-install_pkg curl gpg ca-certificates lsb-release
+install_pkg curl gpg ca-certificates
 
 log_ok ">>> [WARP 2/5] 添加 Cloudflare 官方软件源 GPG Key..."
-mkdir -p /usr/share/keyrings
-TMP_GPG=$(mktemp)
-trap 'rm -f "$TMP_GPG"' EXIT
-fetch_to_file "$TMP_GPG" "https://pkg.cloudflareclient.com/pubkey.gpg"
-gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg < "$TMP_GPG"
-rm -f "$TMP_GPG"
+setup_cloudflare_warp_repo
 
-. /etc/os-release 2>/dev/null || true
-CODENAME="${VERSION_CODENAME:-$(lsb_release -cs 2>/dev/null || echo bookworm)}"
-if ! curl -fsI --connect-timeout 5 "https://pkg.cloudflareclient.com/dists/${CODENAME}/Release" >/dev/null 2>&1; then
-    if [ "${ID:-}" = "ubuntu" ] || [[ "${ID_LIKE:-}" == *ubuntu* ]]; then
-        CODENAME="noble"
-    else
-        CODENAME="bookworm"
-    fi
-    log_warn "⚠️ Cloudflare 官方源暂未提供当前代号仓库，已自动回退使用 ${CODENAME}。"
-fi
-echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${CODENAME} main" \
-    > /etc/apt/sources.list.d/cloudflare-client.list
-
-log_ok ">>> [WARP 3/5] 安装官方 cloudflare-warp 客户端..."
-install_pkg cloudflare-warp
+log_ok ">>> [WARP 3/5] 安装官方 cloudflare-warp 无 GUI 精简客户端..."
+install_cloudflare_warp_headless
 
 log_ok ">>> [WARP 4/5] 启动官方服务并配置 SOCKS5 模式 (MASQUE / 40000 端口)..."
 systemctl enable --now warp-svc

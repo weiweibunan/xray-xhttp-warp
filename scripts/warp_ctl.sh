@@ -119,9 +119,31 @@ case "${1:-}" in
             echo "❌ 当前系统不支持 apt-get 更新！"
             exit 1
         fi
-        DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install --only-upgrade -y cloudflare-warp
+        REPO_URL="${REPO_URL:-https://raw.githubusercontent.com/weiweibunan/xray-xhttp-warp/main}"
+        SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+        TMP_COMMON=""
+        if [ -f "${SCRIPT_DIR}/common.sh" ]; then
+            . "${SCRIPT_DIR}/common.sh"
+        elif [ -f "${SCRIPT_DIR}/scripts/common.sh" ]; then
+            . "${SCRIPT_DIR}/scripts/common.sh"
+        else
+            TMP_COMMON=$(mktemp /tmp/warp-common.XXXXXX.sh)
+            if ! curl -fsSL --connect-timeout 15 --retry 3 "${REPO_URL}/scripts/common.sh" -o "$TMP_COMMON"; then
+                rm -f "$TMP_COMMON"
+                echo "❌ 下载公共函数库 scripts/common.sh 失败！"
+                exit 1
+            fi
+            . "$TMP_COMMON"
+        fi
+        rc=0
+        setup_cloudflare_warp_repo && install_cloudflare_warp_headless || rc=$?
+        [ -n "$TMP_COMMON" ] && rm -f "$TMP_COMMON"
+        [ "$rc" -eq 0 ] || exit "$rc"
         systemctl restart warp-svc 2>/dev/null || true
-        sleep 2
+        for _i in $(seq 1 15); do
+            "$CLI" --accept-tos status >/dev/null 2>&1 && break
+            sleep 1
+        done
         "$CLI" --accept-tos connect 2>/dev/null || true
         ;;
 

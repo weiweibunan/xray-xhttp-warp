@@ -593,3 +593,243 @@ resolve_or_issue_xray_cert() {
         esac
     done
 }
+
+# 配置 Cloudflare 官方 WARP APT 软件源与 GPG 密钥
+setup_cloudflare_warp_repo() {
+    command -v apt-get >/dev/null 2>&1 || return 1
+    if ! command -v gpg >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
+        install_pkg curl gnupg ca-certificates || return 1
+    fi
+
+    mkdir -p /usr/share/keyrings /etc/apt/sources.list.d
+    local tmp_gpg codename=""
+    tmp_gpg=$(mktemp)
+    if ! fetch_to_file "$tmp_gpg" "https://pkg.cloudflareclient.com/pubkey.gpg"; then
+        rm -f "$tmp_gpg"
+        log_err "❌ 下载 Cloudflare 官方 APT 公钥失败！"
+        return 1
+    fi
+    if ! gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg < "$tmp_gpg"; then
+        rm -f "$tmp_gpg"
+        log_err "❌ 导入 Cloudflare 官方 APT 公钥失败！"
+        return 1
+    fi
+    rm -f "$tmp_gpg"
+
+    . /etc/os-release 2>/dev/null || true
+    codename="${VERSION_CODENAME:-}"
+    if [ -z "$codename" ] && command -v lsb_release >/dev/null 2>&1; then
+        codename=$(lsb_release -cs 2>/dev/null || true)
+    fi
+    [ -z "$codename" ] && codename="bookworm"
+    if ! curl -fsI --connect-timeout 5 "https://pkg.cloudflareclient.com/dists/${codename}/Release" >/dev/null 2>&1; then
+        if [ "${ID:-}" = "ubuntu" ] || [[ "${ID_LIKE:-}" == *ubuntu* ]]; then
+            codename="noble"
+        else
+            codename="bookworm"
+        fi
+        log_warn "⚠️ Cloudflare 官方源暂未提供当前代号仓库，已自动回退使用 ${codename}。"
+    fi
+    echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${codename} main" \
+        > /etc/apt/sources.list.d/cloudflare-client.list
+}
+
+# 按白名单拆分 cloudflare-warp 的 Depends 字段，输出两行: KEPT|... 和 DROPPED|...
+_filter_warp_depends() {
+    awk -v raw="$1" '
+        function is_allowed_dep(item, pkg) {
+            pkg = item
+            sub(/[[:space:]]*\([^)]*\)/, "", pkg)
+            sub(/:[A-Za-z0-9_-]+$/, "", pkg)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", pkg)
+            return (pkg ~ /^(libc6|libc-bin|libgcc(-s1|1)|libstdc\+\+6|zlib1g|libzstd1|libdbus-1-3|dbus|libsystemd0|systemd|iproute2|nftables|iptables|libcap2(-bin)?|libpcap[0-9.]*(t64)?|libnl-[0-9-]+|libmnl0|gnupg2?|ca-certificates|libnss3(-tools)?|libnspr4|libssl[0-9.]*(t64)?|openssl|libtss2-[a-z0-9.-]+|libsqlite3-[0-9.]+(t64)?|libcurl[0-9][a-z0-9.-]*|curl)$/)
+        }
+        BEGIN {
+            n = split(raw, deps, /,[[:space:]]*/)
+            kept_out = ""; drop_out = ""
+            for (i = 1; i <= n; i++) {
+                d = deps[i]
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", d)
+                if (d == "") continue
+                m = split(d, alts, /[[:space:]]*\|[[:space:]]*/)
+                kept_alt = ""
+                for (j = 1; j <= m; j++) {
+                    a = alts[j]
+                    gsub(/^[[:space:]]+|[[:space:]]+$/, "", a)
+                    if (is_allowed_dep(a)) {
+                        kept_alt = (kept_alt == "" ? a : kept_alt " | " a)
+                    }
+                }
+                if (kept_alt != "") {
+                    kept_out = (kept_out == "" ? kept_alt : kept_out ", " kept_alt)
+                } else {
+                    drop_out = (drop_out == "" ? d : drop_out ", " d)
+                }
+            }
+            print "KEPT|" kept_out
+            print "DROPPED|" drop_out
+        }
+    '
+}
+
+# 从官方 signed APT 仓库下载 cloudflare-warp .deb 并剥离桌面 GUI 组件及图形硬依赖，
+# 采用白名单保留无头运行必需依赖，避免无头服务器拉取 150+ 个 GTK/WebKitGTK/Mesa/X11/Wayland 包。
+install_cloudflare_warp_headless() {
+    command -v apt-get >/dev/null 2>&1 || return 1
+    command -v dpkg-deb >/dev/null 2>&1 || return 1
+
+    DEBIAN_FRONTEND=noninteractive apt-get update -y || return 1
+
+    local cur_status="" cur_ver="" cur_deps="" cur_dropped="" cand_ver="" had_gui_deps="0"
+    cur_status=$(dpkg-query -W -f='${db:Status-Status}' cloudflare-warp 2>/dev/null || true)
+    if [ "$cur_status" = "installed" ]; then
+        cur_ver=$(dpkg-query -W -f='${Version}' cloudflare-warp 2>/dev/null || true)
+        cur_deps=$(dpkg-query -W -f='${Depends}' cloudflare-warp 2>/dev/null || true)
+        cur_dropped=$(_filter_warp_depends "$cur_deps" | awk -F'|' '/^DROPPED\|/{print substr($0, 9)}')
+        [ -n "$cur_dropped" ] && had_gui_deps="1"
+    fi
+
+    cand_ver=$(LC_ALL=C apt-cache policy cloudflare-warp 2>/dev/null | awk '/Candidate:/{print $2; exit}')
+    if [ "$cur_status" = "installed" ] && [ -n "$cur_ver" ] && [ -n "$cand_ver" ] && [ "$cand_ver" != "(none)" ] && [ "$cur_ver" = "$cand_ver" ] && [ "$had_gui_deps" = "0" ]; then
+        apt-mark hold cloudflare-warp >/dev/null 2>&1 || true
+        log_ok "✅ cloudflare-warp (${cur_ver}，无 GUI 精简版) 已是最新版本！"
+        return 0
+    fi
+
+    local base_tmp="/tmp"
+    [ -d /var/tmp ] && [ -w /var/tmp ] && base_tmp="/var/tmp"
+    local work_dir
+    work_dir=$(mktemp -d "${base_tmp}/warp-headless.XXXXXX")
+    chmod 755 "$work_dir"
+
+    log_info ">>> 正在从 Cloudflare 官方源下载并按白名单构建无 GUI 精简版 cloudflare-warp..."
+    if ! (cd "$work_dir" && DEBIAN_FRONTEND=noninteractive apt-get -o APT::Sandbox::User=root download cloudflare-warp); then
+        rm -rf "$work_dir"
+        log_err "❌ 下载官方 cloudflare-warp 软件包失败！"
+        return 1
+    fi
+
+    local raw_deb pkg_dir headless_deb inst_kb s
+    raw_deb=$(find "$work_dir" -maxdepth 1 -name 'cloudflare-warp_*.deb' | head -n1)
+    if [ -z "$raw_deb" ] || [ ! -f "$raw_deb" ]; then
+        rm -rf "$work_dir"
+        log_err "❌ 未找到下载的 cloudflare-warp .deb 包！"
+        return 1
+    fi
+
+    pkg_dir="${work_dir}/pkg"
+    if ! dpkg-deb -R "$raw_deb" "$pkg_dir"; then
+        rm -rf "$work_dir"
+        log_err "❌ 解包 cloudflare-warp .deb 失败！"
+        return 1
+    fi
+    rm -f "$raw_deb"
+
+    # 移除桌面托盘程序、Flutter/GTK 运行时与桌面入口文件（不影响 warp-svc / warp-cli）
+    rm -rf \
+        "${pkg_dir}/bin/warp-taskbar" \
+        "${pkg_dir}/usr/bin/warp-taskbar" \
+        "${pkg_dir}/usr/lib/warp" \
+        "${pkg_dir}/usr/lib/systemd/user" \
+        "${pkg_dir}/etc/xdg/autostart" \
+        "${pkg_dir}/usr/share/applications" \
+        "${pkg_dir}/usr/share/icons" \
+        "${pkg_dir}/usr/share/dbus-1/services/com.cloudflare.WarpTaskbar.service"
+
+    local raw_ctrl_deps="" dep_filter_out="" kept_deps="" dropped_deps=""
+    raw_ctrl_deps=$(awk '
+        /^Depends:/ { in_dep=1; sub(/^Depends:[[:space:]]*/, ""); printf "%s", $0; next }
+        in_dep && /^[[:space:]]+/ { sub(/^[[:space:]]+/, ""); printf " %s", $0; next }
+        in_dep { exit }
+    ' "${pkg_dir}/DEBIAN/control")
+    dep_filter_out=$(_filter_warp_depends "$raw_ctrl_deps")
+    kept_deps=$(printf '%s\n' "$dep_filter_out" | awk '/^KEPT\|/{print substr($0, 6); exit}')
+    dropped_deps=$(printf '%s\n' "$dep_filter_out" | awk '/^DROPPED\|/{print substr($0, 9); exit}')
+
+    awk -v kept="$kept_deps" '
+        BEGIN { replaced=0; in_dep=0 }
+        /^Depends:/ {
+            in_dep=1
+            if (kept != "" && !replaced) { print "Depends: " kept; replaced=1 }
+            next
+        }
+        in_dep && /^[[:space:]]+/ { next }
+        { in_dep=0 }
+        /^Installed-Size:/ { next }
+        { print }
+    ' "${pkg_dir}/DEBIAN/control" > "${work_dir}/control.new"
+    inst_kb=$(du -sk --exclude="${pkg_dir}/DEBIAN" "$pkg_dir" 2>/dev/null | awk '{print $1}')
+    [ -n "$inst_kb" ] && echo "Installed-Size: ${inst_kb}" >> "${work_dir}/control.new"
+    mv -f "${work_dir}/control.new" "${pkg_dir}/DEBIAN/control"
+
+    [ -n "$kept_deps" ] && log_info ">>> 白名单保留核心依赖: ${kept_deps}"
+    [ -n "$dropped_deps" ] && log_info ">>> 已过滤非白名单依赖: ${dropped_deps}"
+
+    if [ -f "${pkg_dir}/DEBIAN/md5sums" ]; then
+        grep -vE ' ((usr/)?bin/warp-taskbar|usr/lib/warp/|usr/lib/systemd/user/|etc/xdg/autostart/|usr/share/applications/|usr/share/icons/|usr/share/dbus-1/services/com\.cloudflare\.WarpTaskbar\.service)' \
+            "${pkg_dir}/DEBIAN/md5sums" > "${work_dir}/md5sums.new" || true
+        mv -f "${work_dir}/md5sums.new" "${pkg_dir}/DEBIAN/md5sums"
+    fi
+
+    for s in preinst postinst prerm postrm; do
+        if [ -f "${pkg_dir}/DEBIAN/${s}" ]; then
+            sed -E -i 's/^([[:space:]]*)(for_each_regular_user (cleanup_legacy_desktop_entries|migrate_flutter_data|enable_or_restart_warp_taskbar_service|enable_warp_taskbar_service|disable_warp_taskbar_service|remove_gui_user_data)|update_desktop_database)[[:space:]]*$/\1:/' "${pkg_dir}/DEBIAN/${s}"
+            chmod 755 "${pkg_dir}/DEBIAN/${s}"
+        fi
+    done
+
+    headless_deb="${work_dir}/cloudflare-warp-headless.deb"
+    # 使用 -Znone 跳过耗时的 xz 二次压缩，避免低内存小鸡 tmpfs 爆满或长时间卡死
+    if ! dpkg-deb -b -Znone --root-owner-group "$pkg_dir" "$headless_deb"; then
+        rm -rf "$work_dir"
+        log_err "❌ 重新打包无 GUI 版 cloudflare-warp 失败！"
+        return 1
+    fi
+    rm -rf "$pkg_dir"
+
+    apt-mark unhold cloudflare-warp >/dev/null 2>&1 || true
+    local install_ok=1
+    if [ "$cur_status" = "installed" ] && [ "$cur_ver" = "$cand_ver" ]; then
+        # 同版本替换（例如将旧版带 GUI 依赖的官方包原位替换为无 GUI 精简版）
+        if dpkg -i --force-confdef --force-confold "$headless_deb" && DEBIAN_FRONTEND=noninteractive apt-get install -y -f --no-install-recommends; then
+            install_ok=0
+        fi
+    else
+        if DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$headless_deb"; then
+            install_ok=0
+        fi
+    fi
+    rm -rf "$work_dir"
+
+    if [ "$install_ok" -ne 0 ]; then
+        log_err "❌ 安装无 GUI 精简版 cloudflare-warp 失败！"
+        return 1
+    fi
+
+    # 锁定包版本，防止 apt upgrade 重新拉取带 GUI 依赖的上游包；升级请使用 'warp update'
+    apt-mark hold cloudflare-warp >/dev/null 2>&1 || true
+
+    # 安装后校验保留二进制的动态链接库完整性，防止未来新版新增核心库时漏判
+    local bin_name bin_path missing_libs
+    for bin_name in warp-svc warp-cli warp-diag warp-dex; do
+        bin_path=""
+        if [ -x "/bin/${bin_name}" ]; then
+            bin_path="/bin/${bin_name}"
+        elif [ -x "/usr/bin/${bin_name}" ]; then
+            bin_path="/usr/bin/${bin_name}"
+        fi
+        [ -n "$bin_path" ] || continue
+        missing_libs=$(ldd "$bin_path" 2>/dev/null | grep "not found" || true)
+        if [ -n "$missing_libs" ]; then
+            log_err "❌ ${bin_path} 缺少动态依赖库，可能与上游新版新增依赖不兼容："
+            log_err "$missing_libs"
+            [ -n "$dropped_deps" ] && log_warn "👉 本次被白名单过滤的上游依赖: ${dropped_deps}"
+            return 1
+        fi
+    done
+
+    if [ "$had_gui_deps" = "1" ]; then
+        log_info "💡 已将 cloudflare-warp 替换为无 GUI 精简版；如需清理此前遗留的图形包可执行: apt-get autoremove -y"
+    fi
+    return 0
+}

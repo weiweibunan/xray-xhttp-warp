@@ -68,9 +68,9 @@ flowchart TD
 
 ## 项目亮点
 
-1. **纯官方组件与轻量容器回退**：
-   - 原生模式 100% 使用 Cloudflare 官方 `cloudflare-warp` 与官方 `XTLS/Xray-core`。
-   - 隧道模式在 Debian/Ubuntu Systemd 环境优先使用官方 `cloudflare-warp` 获取凭据；在精简容器/无 D-Bus 环境下自动改用 `xray wg` + Cloudflare 官方注册接口获取真实独立凭据。
+1. **纯官方组件与无 GUI 白名单精简部署**：
+   - 原生模式 100% 使用 Cloudflare 官方 `cloudflare-warp` 与官方 `XTLS/Xray-core`；安装与升级 WARP 时按**核心依赖白名单**过滤，自动剥离桌面托盘 (`warp-taskbar`) 与所有非必需 GUI 图形依赖，并在安装后校验守护进程动态库 (`ldd`) 完整性，避免污染无头服务器并保持 `apt` 依赖健康。
+   - 隧道模式在 Debian/Ubuntu Systemd 环境优先使用官方无 GUI `cloudflare-warp` 获取凭据；在精简容器/无 D-Bus 环境下自动改用 `xray wg` + Cloudflare 官方注册接口获取真实独立凭据。
 2. **多模式智能适配与集成证书申请**：
    - **原生 VPS 模式**：双栈监听 (443/8443)，具备 CDN 优选、TCP 直连与 H3/QUIC 三种节点；并**可选附加开启 Cloudflare Tunnel 隧道入栈**（新增第 4 个隧道优选节点，`cloudflared -> 127.0.0.1` 免证书内网回源，支持随时通过 `xm tunnel` 动态开关）。**内置集成官方 `acmesh-official/acme.sh`**：支持 80 端口域名证书、Cloudflare/DNSPod/阿里云 DNS API（单域名与泛域名，无需开 80 端口、可全程保留 CF 小黄云）、以及 IP 短期证书，并配置自动续期重载 Xray；默认读取 `/etc/xray/cert/` 证书，也支持通过环境变量指定已有证书路径。
    - **容器/NAT 穿透模式**：专为无开放端口、无 Systemd 的容器/轻量沙箱（如 Altare、Docker、PRoot）量身定制，通过 `EnvironmentFile` 安全传递 Tunnel Token，免证书、免开公网端口。
@@ -139,7 +139,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/weiweibunan/xray-xhttp-warp/
 | `warp restart` | 重启官方 WARP 隧道连接 |
 | `warp register` | 重新向 Cloudflare 注册客户端 |
 | `warp logs` | 查看 WARP 官方后台日志 |
-| `warp update` | 升级官方 `cloudflare-warp` 客户端包 |
+| `warp update` | 以无 GUI 精简方式升级官方 `cloudflare-warp` 客户端包 |
 
 ---
 
