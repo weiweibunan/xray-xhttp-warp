@@ -6,6 +6,42 @@
 set -e
 
 REPO_URL="${REPO_URL:-https://raw.githubusercontent.com/weiweibunan/xray-xhttp-warp/main}"
+
+# 非 root 用户（如云主机默认的 ubuntu/debian/admin 账号）直接执行 bash <(curl ...) 时自动通过 sudo 提权；
+# 若直接写 sudo bash <(curl ...)，sudo 会关闭 /dev/fd 管道句柄导致报 No such file or directory，因此由脚本内部安全中转。
+if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+    if command -v sudo >/dev/null 2>&1; then
+        echo ">>> 检测到当前为非 root 用户 ($(id -un))，正在通过 sudo 自动提权..."
+        _ELEVATE_ENV=()
+        for _v in REPO_URL CERT_PATH KEY_PATH ENABLE_CF_TUNNEL CF_TOKEN CF_DOMAIN LOCAL_PORT; do
+            if [ "${!_v+set}" = "set" ]; then
+                _ELEVATE_ENV+=("${_v}=${!_v}")
+            fi
+        done
+        _SELF_SRC="${BASH_SOURCE[0]:-}"
+        if [ -n "$_SELF_SRC" ] && [ -f "$_SELF_SRC" ] && [[ "$_SELF_SRC" != /dev/fd/* ]] && [[ "$_SELF_SRC" != /proc/*/fd/* ]]; then
+            _SELF_ABS=$(cd "$(dirname "$_SELF_SRC")" && pwd)/$(basename "$_SELF_SRC")
+            exec sudo env "${_ELEVATE_ENV[@]}" bash "$_SELF_ABS" "$@"
+        else
+            _TMP_SELF=$(mktemp /tmp/xray-install.XXXXXX.sh)
+            trap 'rm -f "$_TMP_SELF"' EXIT
+            if ! curl -fsSL --connect-timeout 15 --retry 3 "${REPO_URL}/install.sh" -o "$_TMP_SELF"; then
+                rm -f "$_TMP_SELF"
+                echo "❌ 下载安装脚本进行 sudo 提权失败！请先执行 'sudo -i' 切换到 root 后重试。" >&2
+                exit 1
+            fi
+            chmod 644 "$_TMP_SELF"
+            _rc=0
+            sudo env "${_ELEVATE_ENV[@]}" bash "$_TMP_SELF" "$@" || _rc=$?
+            rm -f "$_TMP_SELF"
+            exit "$_rc"
+        fi
+    else
+        echo "❌ 请使用 root 权限执行此脚本！（提示：可先执行 'su -' 切换到 root 后再运行）" >&2
+        exit 1
+    fi
+fi
+
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 if [ -f "${SCRIPT_DIR}/scripts/common.sh" ]; then

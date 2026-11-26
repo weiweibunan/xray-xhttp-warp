@@ -24,7 +24,7 @@ log_err()  { echo -e "${RED}$*${PLAIN}" >&2; }
 
 require_root() {
     if [ "${EUID:-$(id -u)}" -ne 0 ]; then
-        log_err "❌ 请使用 root 权限执行此脚本！"
+        log_err "❌ 请使用 root 权限执行此脚本！（提示：非 root 用户请先执行 'sudo -i'，或通过 install.sh 自动 sudo 提权运行）"
         exit 1
     fi
 }

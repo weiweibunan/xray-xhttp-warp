@@ -89,6 +89,7 @@ flowchart TD
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/weiweibunan/xray-xhttp-warp/main/install.sh)
 ```
+> 💡 若当前以 `ubuntu`、`debian`、`admin` 等非 root 普通用户登录，直接运行上述命令会自动调用 `sudo` 提权（请勿直接写成 `sudo bash <(curl ...)`，因 `sudo` 默认会关闭进程替换的文件描述符）；也可先执行 `sudo -i` 切换 root 后再运行。
 
 ### 快捷安装指定模式
 
