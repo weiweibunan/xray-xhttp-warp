@@ -152,8 +152,15 @@ install_all() {
 }
 
 uninstall_all() {
-    local confirm=""
-    if [ "${1:-}" != "--yes" ]; then
+    local auto_yes=0 purge_cert=0 _arg confirm=""
+    for _arg in "$@"; do
+        case "$_arg" in
+            --yes|-y) auto_yes=1 ;;
+            --purge-cert) purge_cert=1 ;;
+        esac
+    done
+
+    if [ "$auto_yes" -ne 1 ]; then
         read_tty -p "⚠️ 确认要彻底卸载 Xray、Cloudflare Tunnel 与 WARP 全套组件及配置吗？(y/n): " confirm
         if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
             log_warn "已取消卸载。"
@@ -195,15 +202,23 @@ uninstall_all() {
           /usr/local/bin/xm /usr/bin/xm /usr/local/bin/xinfo \
           /usr/local/bin/xray /usr/local/bin/cloudflared \
           /var/log/xray.log /var/log/cloudflared.log /var/log/xray-geo-update.log
-    rm -rf /etc/xray /usr/local/share/xray /var/lib/cloudflare-warp
+    cleanup_xray_dir_preserving_cert 0
+    rm -rf /usr/local/share/xray /var/lib/cloudflare-warp
     is_systemd && systemctl daemon-reload 2>/dev/null || true
 
-    if [ "${1:-}" != "--yes" ] && [ -x /root/.acme.sh/acme.sh ]; then
-        local rm_acme=""
-        read_tty -p "检测到官方 acme.sh，是否一并卸载 acme.sh 及定时续期任务？(y/n): " rm_acme
-        if [[ "$rm_acme" == "y" || "$rm_acme" == "Y" ]]; then
-            /root/.acme.sh/acme.sh --uninstall >/dev/null 2>&1 || true
+    if [ -d /etc/xray/cert ] || [ -x /root/.acme.sh/acme.sh ] || [ -d /root/.acme.sh ]; then
+        if [ "$auto_yes" -ne 1 ]; then
+            local rm_cert=""
+            read_tty -p "检测到 SSL 证书 (/etc/xray/cert) 或 acme.sh，是否一并卸载清理？[y/N] (默认回车保留，防重装限频): " rm_cert || rm_cert="n"
+            [[ "$rm_cert" == "y" || "$rm_cert" == "Y" ]] && purge_cert=1
+        fi
+        if [ "$purge_cert" -eq 1 ]; then
+            cleanup_xray_dir_preserving_cert 1
+            [ -x /root/.acme.sh/acme.sh ] && /root/.acme.sh/acme.sh --uninstall >/dev/null 2>&1 || true
             rm -rf /root/.acme.sh
+            log_warn "🗑️ 已一并卸载清理 SSL 证书与 acme.sh。"
+        else
+            log_info "ℹ️ 已保留 SSL 证书 (/etc/xray/cert) 与 acme.sh 续期配置（下次安装可直接选择使用）。"
         fi
     fi
 
@@ -248,6 +263,6 @@ case "${1:-}" in
     xray) install_xray_only ;;
     cert) install_cert_only "${2:-}" ;;
     bbr) enable_bbr ;;
-    uninstall) uninstall_all "${2:-}" ;;
+    uninstall) shift; uninstall_all "$@" ;;
     *) show_menu ;;
 esac

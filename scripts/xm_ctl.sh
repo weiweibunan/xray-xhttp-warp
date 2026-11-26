@@ -1443,8 +1443,15 @@ cleanup_autostart_hooks() {
 }
 
 uninstall_xray() {
-    local confirm=""
-    if [ "${1:-}" != "--yes" ]; then
+    local auto_yes=0 purge_cert=0 _arg confirm=""
+    for _arg in "$@"; do
+        case "$_arg" in
+            --yes|-y) auto_yes=1 ;;
+            --purge-cert) purge_cert=1 ;;
+        esac
+    done
+
+    if [ "$auto_yes" -ne 1 ]; then
         read_tty -p "⚠️ 确认要彻底卸载 Xray 及隧道服务与配置吗？(y/n): " confirm
         if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
             echo -e "${YELLOW}已取消卸载。${PLAIN}"
@@ -1463,14 +1470,36 @@ uninstall_xray() {
         systemctl daemon-reload
     fi
     cleanup_autostart_hooks
-    rm -rf /etc/xray /usr/local/share/xray
+    if [ -d /etc/xray ]; then
+        find /etc/xray -mindepth 1 -maxdepth 1 ! -name cert -exec rm -rf {} + 2>/dev/null || true
+        rmdir /etc/xray 2>/dev/null || true
+    fi
+    rm -rf /usr/local/share/xray
     rm -f /usr/local/bin/xray /usr/local/bin/cloudflared \
           /usr/local/bin/xm /usr/bin/xm /usr/local/bin/xinfo \
           /var/log/xray.log /var/log/cloudflared.log "$GEO_LOG"
     [ -L /usr/local/bin/warp ] && [ ! -e /usr/local/bin/warp ] && rm -f /usr/local/bin/warp
     [ -L /usr/bin/warp ] && [ ! -e /usr/bin/warp ] && rm -f /usr/bin/warp
+
+    if [ -d /etc/xray/cert ] || [ -x /root/.acme.sh/acme.sh ] || [ -d /root/.acme.sh ]; then
+        if [ "$auto_yes" -ne 1 ]; then
+            local rm_cert=""
+            read_tty -p "检测到 SSL 证书 (/etc/xray/cert) 或 acme.sh，是否一并卸载清理？[y/N] (默认回车保留，防重装限频): " rm_cert || rm_cert="n"
+            [[ "$rm_cert" == "y" || "$rm_cert" == "Y" ]] && purge_cert=1
+        fi
+        if [ "$purge_cert" -eq 1 ]; then
+            rm -rf /etc/xray/cert
+            rmdir /etc/xray 2>/dev/null || true
+            [ -x /root/.acme.sh/acme.sh ] && /root/.acme.sh/acme.sh --uninstall >/dev/null 2>&1 || true
+            rm -rf /root/.acme.sh
+            echo -e "${YELLOW}🗑️ 已一并卸载清理 SSL 证书与 acme.sh。${PLAIN}"
+        elif [ "$auto_yes" -ne 1 ]; then
+            echo -e "${CYAN}ℹ️ 已保留 SSL 证书 (/etc/xray/cert) 与 acme.sh 续期配置（下次安装可直接复用）。${PLAIN}"
+        fi
+    fi
+
     echo -e "${GREEN}✅ 服务及管理组件已彻底清理卸载干净！${PLAIN}"
-    [ "${1:-}" = "--yes" ] || exit 0
+    [ "$auto_yes" -eq 1 ] || exit 0
 }
 
 warp_print_help() {
@@ -2003,6 +2032,6 @@ case "${1:-}" in
     geo-cron) set_geo_schedule_cli "${2:-}" "${3:-}" "${4:-}" ;;
     test) test_config ;;
     bbr) enable_bbr ;;
-    uninstall|del) uninstall_xray "${2:-}" ;;
+    uninstall|del) shift; uninstall_xray "$@" ;;
     *) menu ;;
 esac

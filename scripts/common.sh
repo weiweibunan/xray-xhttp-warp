@@ -530,6 +530,18 @@ cleanup_autostart_hooks() {
     done
 }
 
+cleanup_xray_dir_preserving_cert() {
+    local purge_cert="${1:-0}"
+    if [ "$purge_cert" = "1" ]; then
+        rm -rf /etc/xray
+        return 0
+    fi
+    if [ -d /etc/xray ]; then
+        find /etc/xray -mindepth 1 -maxdepth 1 ! -name cert -exec rm -rf {} + 2>/dev/null || true
+        rmdir /etc/xray 2>/dev/null || true
+    fi
+}
+
 resolve_or_issue_xray_cert() {
     local caller_dir="${1:-}"
     local cert="${CERT_PATH:-}"
@@ -540,23 +552,71 @@ resolve_or_issue_xray_cert() {
         return 0
     fi
 
-    if [ -f "/etc/xray/cert/cert.crt" ] && [ -f "/etc/xray/cert/private.key" ]; then
-        export CERT_PATH="/etc/xray/cert/cert.crt" KEY_PATH="/etc/xray/cert/private.key"
-        log_ok "✅ 已自动检测到证书: ${CERT_PATH}"
-        return 0
-    fi
+    local default_cert="/etc/xray/cert/cert.crt"
+    local default_key="/etc/xray/cert/private.key"
+    local has_saved_cert=0 choice="" action=""
 
-    log_warn "⚠️ 未在默认路径 /etc/xray/cert 检测到 TLS 证书，原生模式必须配置域名证书。"
     while true; do
-        echo -e "${BLUE}--------------------------------------------------${PLAIN}"
-        echo -e " ${GREEN}1.${PLAIN} 一键申请免费 SSL 证书 (集成官方 acme.sh) [推荐]"
-        echo -e " ${GREEN}2.${PLAIN} 手动输入服务器上已有的证书与私钥路径"
-        echo -e " ${YELLOW}0.${PLAIN} 退出安装"
-        echo -e "${BLUE}--------------------------------------------------${PLAIN}"
-        local choice input_cert input_key
-        read_tty -p "请选择证书来源 [0-2]: " choice || return 1
-        case "$choice" in
-            1)
+        has_saved_cert=0
+        [ -f "$default_cert" ] && [ -f "$default_key" ] && has_saved_cert=1
+        choice=""
+        action=""
+
+        if [ "$has_saved_cert" -eq 1 ]; then
+            local cert_info="" cert_end=""
+            if command -v openssl >/dev/null 2>&1; then
+                cert_info=$(openssl x509 -in "$default_cert" -noout -ext subjectAltName 2>/dev/null | tr '\n' ' ' | sed 's/X509v3 Subject Alternative Name://; s/^[[:space:]]*//; s/[[:space:]]*$//' || true)
+                [ -z "$cert_info" ] && cert_info=$(openssl x509 -in "$default_cert" -noout -subject 2>/dev/null | sed 's/^subject=//; s/^[[:space:]]*//' || true)
+                cert_end=$(openssl x509 -in "$default_cert" -noout -enddate 2>/dev/null | cut -d= -f2 || true)
+                if [ -n "$cert_end" ] && ! openssl x509 -in "$default_cert" -noout -checkend 0 >/dev/null 2>&1; then
+                    cert_end="${cert_end} (⚠️ 已过期)"
+                fi
+            fi
+            log_ok "✅ 检测到服务器上已有 TLS 证书: ${default_cert}"
+            [ -n "$cert_info" ] && echo -e "  - 证书域名 : ${CYAN}${cert_info}${PLAIN}"
+            [ -n "$cert_end" ] && echo -e "  - 有效期限 : ${CYAN}${cert_end}${PLAIN}"
+            echo -e "${BLUE}--------------------------------------------------${PLAIN}"
+            echo -e " ${GREEN}1.${PLAIN} 使用已有证书 (直接复用，默认) [推荐]"
+            echo -e " ${GREEN}2.${PLAIN} 重新申请新 SSL 证书 (集成官方 acme.sh)"
+            echo -e " ${GREEN}3.${PLAIN} 手动输入其他证书与私钥路径"
+            echo -e " ${YELLOW}0.${PLAIN} 退出安装"
+            echo -e "${BLUE}--------------------------------------------------${PLAIN}"
+            read_tty -p "请选择证书处理方式 [0-3，默认 1]: " choice || return 1
+            [ -z "$choice" ] && choice="1"
+            case "$choice" in
+                1) action="use_saved" ;;
+                2) action="issue" ;;
+                3) action="manual" ;;
+                0) action="exit" ;;
+                *) action="invalid" ;;
+            esac
+        else
+            log_warn "⚠️ 未在默认路径 /etc/xray/cert 检测到 TLS 证书，原生模式必须配置域名证书。"
+            echo -e "${BLUE}--------------------------------------------------${PLAIN}"
+            echo -e " ${GREEN}1.${PLAIN} 一键申请免费 SSL 证书 (集成官方 acme.sh) [推荐]"
+            echo -e " ${GREEN}2.${PLAIN} 手动输入服务器上已有的证书与私钥路径"
+            echo -e " ${YELLOW}0.${PLAIN} 退出安装"
+            echo -e "${BLUE}--------------------------------------------------${PLAIN}"
+            read_tty -p "请选择证书来源 [0-2]: " choice || return 1
+            case "$choice" in
+                1) action="issue" ;;
+                2) action="manual" ;;
+                0) action="exit" ;;
+                *) action="invalid" ;;
+            esac
+        fi
+
+        case "$action" in
+            use_saved)
+                if command -v openssl >/dev/null 2>&1 && ! openssl x509 -in "$default_cert" -noout >/dev/null 2>&1; then
+                    log_warn "⚠️ 现有证书文件格式无效，请选择 2 重新申请或 3 手动指定！"
+                    continue
+                fi
+                export CERT_PATH="$default_cert" KEY_PATH="$default_key"
+                log_ok "✅ 已选择使用已有证书: ${default_cert}"
+                return 0
+                ;;
+            issue)
                 local cert_script="" tmp_dir=""
                 if [ -n "$caller_dir" ] && [ -f "${caller_dir}/install_cert.sh" ]; then
                     cert_script="${caller_dir}/install_cert.sh"
@@ -573,15 +633,16 @@ resolve_or_issue_xray_cert() {
                     chmod +x "${tmp_dir}/install_cert.sh"
                     cert_script="${tmp_dir}/install_cert.sh"
                 fi
-                if bash "$cert_script" issue && [ -f "/etc/xray/cert/cert.crt" ] && [ -f "/etc/xray/cert/private.key" ]; then
+                if bash "$cert_script" issue && [ -f "$default_cert" ] && [ -f "$default_key" ]; then
                     [ -n "$tmp_dir" ] && rm -rf "$tmp_dir"
-                    export CERT_PATH="/etc/xray/cert/cert.crt" KEY_PATH="/etc/xray/cert/private.key"
+                    export CERT_PATH="$default_cert" KEY_PATH="$default_key"
                     return 0
                 fi
                 [ -n "$tmp_dir" ] && rm -rf "$tmp_dir"
                 log_warn "⚠️ 证书尚未就绪，请重试或选择其他方式。"
                 ;;
-            2)
+            manual)
+                local input_cert input_key
                 read_tty -p "请输入证书公钥路径 (cert.crt / fullchain.pem): " input_cert
                 read_tty -p "请输入证书私钥路径 (private.key / privkey.pem): " input_key
                 if [ -f "$input_cert" ] && [ -f "$input_key" ]; then
@@ -590,7 +651,7 @@ resolve_or_issue_xray_cert() {
                 fi
                 log_err "❌ 指定的文件不存在，请重新输入！"
                 ;;
-            0)
+            exit)
                 log_warn "已取消安装。"
                 return 1
                 ;;
