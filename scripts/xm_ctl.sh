@@ -1921,6 +1921,566 @@ manage_cert() {
     esac
 }
 
+open_firewall_port_xm() {
+    local proto="$1"
+    local port="$2"
+    local opened=()
+
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+        if ufw allow "${port}/${proto}" >/dev/null 2>&1; then
+            opened+=("ufw")
+        fi
+    fi
+    if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        if firewall-cmd --add-port="${port}/${proto}" --permanent >/dev/null 2>&1 && firewall-cmd --reload >/dev/null 2>&1; then
+            opened+=("firewalld")
+        fi
+    fi
+    if command -v iptables >/dev/null 2>&1; then
+        if iptables -S INPUT 2>/dev/null | grep -qE '^-P INPUT (DROP|REJECT)|^-A INPUT .*-j (REJECT|DROP)'; then
+            if ! iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; then
+                local line_num
+                line_num=$(iptables -L INPUT --line-numbers -n 2>/dev/null | awk '$2=="REJECT" || $2=="DROP" {print $1; exit}')
+                if [ -n "$line_num" ]; then
+                    iptables -I INPUT "$line_num" -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || true
+                else
+                    iptables -A INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || true
+                fi
+                if command -v netfilter-persistent >/dev/null 2>&1; then
+                    netfilter-persistent save >/dev/null 2>&1 || true
+                elif [ -d /etc/iptables ] && command -v iptables-save >/dev/null 2>&1; then
+                    iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+                fi
+            fi
+            opened+=("iptables")
+        fi
+    fi
+    if command -v ip6tables >/dev/null 2>&1; then
+        if ip6tables -S INPUT 2>/dev/null | grep -qE '^-P INPUT (DROP|REJECT)|^-A INPUT .*-j (REJECT|DROP)'; then
+            if ! ip6tables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; then
+                local line6_num
+                line6_num=$(ip6tables -L INPUT --line-numbers -n 2>/dev/null | awk '$2=="REJECT" || $2=="DROP" {print $1; exit}')
+                if [ -n "$line6_num" ]; then
+                    ip6tables -I INPUT "$line6_num" -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || true
+                else
+                    ip6tables -A INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || true
+                fi
+                if command -v netfilter-persistent >/dev/null 2>&1; then
+                    netfilter-persistent save >/dev/null 2>&1 || true
+                elif [ -d /etc/iptables ] && command -v ip6tables-save >/dev/null 2>&1; then
+                    ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+                fi
+            fi
+            opened+=("ip6tables")
+        fi
+    fi
+    if [ "${#opened[@]}" -gt 0 ]; then
+        echo -e "${GREEN}✅ 已在本机防火墙 (${opened[*]}) 放行 ${port}/${proto}！${PLAIN}"
+    else
+        echo -e "${CYAN}ℹ️ 本机未启用拦截型防火墙规则（无需额外放行 ${port}/${proto}）。${PLAIN}"
+    fi
+}
+
+ssh_find_sshd_bin() {
+    local b
+    for b in /usr/sbin/sshd /sbin/sshd; do
+        [ -x "$b" ] && { echo "$b"; return 0; }
+    done
+    command -v sshd 2>/dev/null || true
+}
+
+ssh_detect_service_name() {
+    if is_systemd; then
+        if systemctl cat ssh.service >/dev/null 2>&1; then
+            echo "ssh"; return 0
+        fi
+        if systemctl cat sshd.service >/dev/null 2>&1; then
+            echo "sshd"; return 0
+        fi
+    fi
+    if [ -x /etc/init.d/ssh ]; then
+        echo "ssh"
+    elif [ -x /etc/init.d/sshd ]; then
+        echo "sshd"
+    else
+        echo "ssh"
+    fi
+}
+
+ssh_is_socket_activated() {
+    is_systemd || return 1
+    systemctl is-enabled --quiet ssh.socket 2>/dev/null || systemctl is-active --quiet ssh.socket 2>/dev/null
+}
+
+ssh_collect_authorized_keys() {
+    local auth_file home_dir user cnt
+    for auth_file in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
+        [ -f "$auth_file" ] || continue
+        home_dir=$(dirname "$(dirname "$auth_file")")
+        if [ "$home_dir" = "/root" ]; then
+            user="root"
+        else
+            user=$(basename "$home_dir")
+        fi
+        cnt=$(awk '
+            /^[[:space:]]*(#|$)/ { next }
+            /(^|[[:space:]])(ssh-(rsa|ed25519|dss)|ecdsa-sha2-nistp(256|384|521)|sk-(ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com)[[:space:]]+[A-Za-z0-9+\/=]+/ { c++ }
+            END { print c + 0 }
+        ' "$auth_file" 2>/dev/null || echo 0)
+        if [ "${cnt:-0}" -gt 0 ]; then
+            echo "${user}:${cnt}:${auth_file}"
+        fi
+    done
+}
+
+ssh_check_port_conflict() {
+    local port="$1"
+    local line
+    if command -v ss >/dev/null 2>&1; then
+        line=$(ss -tlnp 2>/dev/null | grep -E ":${port}[[:space:]]" || true)
+    elif command -v netstat >/dev/null 2>&1; then
+        line=$(netstat -tlnp 2>/dev/null | grep -E ":${port}[[:space:]]" || true)
+    else
+        return 1
+    fi
+    [ -z "$line" ] && return 1
+    # 排除 sshd 进程及当前 ssh.socket 监听的端口
+    if echo "$line" | grep -qE '"sshd"|"sshd-session"|[0-9]+/sshd'; then
+        return 1
+    fi
+    if echo "$line" | grep -q '"systemd"' && ssh_is_socket_activated; then
+        local sock_ports
+        sock_ports=$(systemctl show ssh.socket -p Listen --value 2>/dev/null || true)
+        if echo "$sock_ports" | grep -qE ":${port}([[:space:]]|$)" || [ "$port" = "22" ]; then
+            return 1
+        fi
+    fi
+    echo "$line"
+    return 0
+}
+
+ssh_live_listen_ports() {
+    local ports="" sock_ports="" all_listen="" p
+    if command -v ss >/dev/null 2>&1; then
+        all_listen=$(ss -tlnp 2>/dev/null || true)
+        ports=$(printf '%s\n' "$all_listen" | awk '/"sshd"|"sshd-session"/ {print $4}' | sed -E 's/.*:([0-9]+)$/\1/' | grep -E '^[0-9]+$' || true)
+        if ssh_is_socket_activated; then
+            sock_ports=$(systemctl show ssh.socket -p Listen --value 2>/dev/null | grep -oE ':[0-9]+' | tr -d ':' || true)
+            for p in $sock_ports; do
+                if printf '%s\n' "$all_listen" | grep -qE ":${p}[[:space:]]"; then
+                    ports="${ports}"$'\n'"${p}"
+                fi
+            done
+        fi
+        ports=$(printf '%s\n' "$ports" | grep -E '^[0-9]+$' | sort -nu | tr '\n' ' ' | sed 's/ $//')
+    fi
+    echo "$ports"
+}
+
+ssh_show_status() {
+    local sshd_bin svc
+    sshd_bin=$(ssh_find_sshd_bin)
+    svc=$(ssh_detect_service_name)
+    echo -e "${BLUE}==================================================${PLAIN}"
+    echo -e "${GREEN}           SSH 端口与安全策略状态                 ${PLAIN}"
+    echo -e "${BLUE}==================================================${PLAIN}"
+    if [ -n "$sshd_bin" ]; then
+        local eff ports pw kbd pub root_login auth_methods
+        eff=$("$sshd_bin" -T 2>/dev/null || true)
+        ports=$(printf '%s\n' "$eff" | awk '$1=="port"{print $2}' | tr '\n' ' ' | sed 's/ $//')
+        pw=$(printf '%s\n' "$eff" | awk '$1=="passwordauthentication"{print $2; exit}')
+        kbd=$(printf '%s\n' "$eff" | awk '$1=="kbdinteractiveauthentication" || $1=="challengeresponseauthentication"{print $2; exit}')
+        pub=$(printf '%s\n' "$eff" | awk '$1=="pubkeyauthentication"{print $2; exit}')
+        root_login=$(printf '%s\n' "$eff" | awk '$1=="permitrootlogin"{print $2; exit}')
+        auth_methods=$(printf '%s\n' "$eff" | awk '$1=="authenticationmethods"{print $2; exit}')
+        echo -e "  配置生效端口 : ${CYAN}${ports:-未知}${PLAIN}"
+        echo -e "  实际监听端口 : ${CYAN}$(ssh_live_listen_ports | sed 's/^$/未知/')${PLAIN}"
+        echo -e "  激活方式     : ${CYAN}$(ssh_is_socket_activated && echo "systemd socket (ssh.socket)" || echo "${svc} service")${PLAIN}"
+        echo -e "  密码登录     : $([ "$pw" = "no" ] && echo "${GREEN}已关闭 (no)${PLAIN}" || echo "${RED}开启 (${pw:-yes})${PLAIN}")"
+        echo -e "  交互认证     : $([ "$kbd" = "no" ] && echo "${GREEN}已关闭 (no)${PLAIN}" || echo "${YELLOW}${kbd:-未知}${PLAIN}")"
+        echo -e "  密钥认证     : $([ "$pub" = "yes" ] && echo "${GREEN}已开启 (yes)${PLAIN}" || echo "${RED}${pub:-未知}${PLAIN}")"
+        echo -e "  认证方法限制 : ${CYAN}${auth_methods:-any}${PLAIN}"
+        echo -e "  Root 登录    : ${CYAN}${root_login:-未知}${PLAIN}"
+    else
+        echo -e "  ${YELLOW}⚠️ 未检测到服务端 sshd 二进制文件 (${svc})。${PLAIN}"
+    fi
+    local key_rows
+    key_rows=$(ssh_collect_authorized_keys || true)
+    if [ -n "$key_rows" ]; then
+        echo -e "  已配置公钥   :"
+        while IFS=: read -r u cnt p; do
+            [ -z "$u" ] && continue
+            echo -e "    - ${GREEN}${u}${PLAIN} (${cnt} 把公钥: ${p})"
+        done <<< "$key_rows"
+    else
+        echo -e "  已配置公钥   : ${RED}无（请先添加公钥后再禁用密码登录！）${PLAIN}"
+    fi
+    echo -e "${BLUE}==================================================${PLAIN}"
+}
+
+ssh_prompt_install_pubkey() {
+    local target_user="" target_home=""
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ] && [ -d "/home/${SUDO_USER}" ]; then
+        target_user="$SUDO_USER"
+        target_home="/home/${SUDO_USER}"
+    else
+        local cand
+        for cand in ubuntu debian admin opc centos alpine; do
+            if id "$cand" >/dev/null 2>&1 && [ -d "/home/${cand}" ]; then
+                target_user="$cand"
+                target_home="/home/${cand}"
+                break
+            fi
+        done
+    fi
+    [ -z "$target_user" ] && { target_user="root"; target_home="/root"; }
+
+    echo -e "${YELLOW}⚠️ 未在 /root/.ssh/authorized_keys 或 /home/*/.ssh/authorized_keys 检测到任何有效 SSH 公钥！${PLAIN}"
+    echo -e "${RED}若此时直接关闭密码登录，你将彻底无法登录服务器！${PLAIN}"
+    local paste_ans pubkey=""
+    read_tty -p "是否现在为账户 '${target_user}' 粘贴添加一把 SSH 公钥？[y/N]: " paste_ans || return 1
+    if [[ "$paste_ans" != "y" && "$paste_ans" != "Y" ]]; then
+        echo -e "${YELLOW}已取消修改，请先配置 SSH 公钥后再执行 xm ssh。${PLAIN}"
+        return 1
+    fi
+    read_tty -p "请粘贴 SSH 公钥整行内容 (如 ssh-ed25519 AAAA...): " pubkey || return 1
+    pubkey=$(echo "$pubkey" | tr -d '\r\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    if [[ ! "$pubkey" =~ (ssh-(rsa|ed25519|dss)|ecdsa-sha2-nistp(256|384|521)|sk-(ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com)[[:space:]]+[A-Za-z0-9+/=]+ ]]; then
+        echo -e "${RED}❌ 公钥格式无效，已中止修改！${PLAIN}"
+        return 1
+    fi
+    if command -v ssh-keygen >/dev/null 2>&1; then
+        if ! printf '%s\n' "$pubkey" | ssh-keygen -l -f - >/dev/null 2>&1; then
+            echo -e "${RED}❌ ssh-keygen 校验证书公钥失败，已中止修改！${PLAIN}"
+            return 1
+        fi
+    fi
+    local target_group
+    target_group=$(id -gn "$target_user" 2>/dev/null || echo "$target_user")
+    mkdir -p "${target_home}/.ssh"
+    chmod 700 "${target_home}/.ssh"
+    touch "${target_home}/.ssh/authorized_keys"
+    printf '%s\n' "$pubkey" >> "${target_home}/.ssh/authorized_keys"
+    chmod 600 "${target_home}/.ssh/authorized_keys"
+    chown -R "${target_user}:${target_group}" "${target_home}/.ssh" 2>/dev/null || true
+    echo -e "${GREEN}✅ 已写入公钥至 ${target_home}/.ssh/authorized_keys！${PLAIN}"
+}
+
+ssh_print_help() {
+    echo "用法: xm ssh [选项|端口号]"
+    echo "  xm ssh              交互式修改 SSH 端口（默认 38291）、放行防火墙并关闭密码仅允许密钥登录"
+    echo "  xm ssh <1-65535>    直接指定目标 SSH 端口并执行端口与仅密钥加固"
+    echo "  xm ssh 38291 --yes  无确认直接修改（仍强制校验存在 SSH 公钥，防止锁死）"
+    echo "  xm ssh status       查看当前 SSH 端口、认证策略与已配置公钥"
+}
+
+apply_ssh_hardening() {
+    local new_port="$1"
+    local sshd_bin svc
+    sshd_bin=$(ssh_find_sshd_bin)
+    svc=$(ssh_detect_service_name)
+
+    if [ -z "$sshd_bin" ] || [ ! -f /etc/ssh/sshd_config ]; then
+        echo -e "${RED}❌ 未检测到 OpenSSH 服务端 (${sshd_bin:-sshd}) 或 /etc/ssh/sshd_config，无法配置！${PLAIN}"
+        return 1
+    fi
+
+    local key_rows
+    key_rows=$(ssh_collect_authorized_keys || true)
+    if [ -z "$key_rows" ]; then
+        echo -e "${RED}❌ 未检测到任何账户的 authorized_keys 公钥，已拒绝关闭密码登录！${PLAIN}"
+        return 1
+    fi
+
+    local has_nonroot_key=0 cur_eff supports_kbd=0 cur_root_login="" target_root_login="prohibit-password"
+    while IFS=: read -r u _ _; do
+        [ -n "$u" ] && [ "$u" != "root" ] && has_nonroot_key=1
+    done <<< "$key_rows"
+    cur_eff=$("$sshd_bin" -T 2>/dev/null || true)
+    printf '%s\n' "$cur_eff" | grep -qi '^kbdinteractiveauthentication ' && supports_kbd=1
+    cur_root_login=$(printf '%s\n' "$cur_eff" | awk '$1=="permitrootlogin"{print $2; exit}')
+    if [ "$cur_root_login" = "no" ] && [ "$has_nonroot_key" -eq 1 ]; then
+        target_root_login="no"
+    fi
+
+    local conflict
+    if conflict=$(ssh_check_port_conflict "$new_port"); then
+        echo -e "${RED}❌ 端口 ${new_port}/tcp 已被其他进程占用: ${conflict}${PLAIN}"
+        return 1
+    fi
+
+    # 1. 在修改并重启 SSH 前先开放防火墙端口
+    open_firewall_port_xm tcp "$new_port"
+    if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" = "Enforcing" ] && command -v semanage >/dev/null 2>&1; then
+        semanage port -a -t ssh_port_t -p tcp "$new_port" >/dev/null 2>&1 || semanage port -m -t ssh_port_t -p tcp "$new_port" >/dev/null 2>&1 || true
+    fi
+
+    # 2. 完整备份现有 SSH 与 ssh.socket 配置以便异常时自动回滚
+    local backup_dir had_socket_dir=0 was_socket_active=0
+    backup_dir=$(mktemp -d /tmp/xm-ssh-bak.XXXXXX)
+    cp -a /etc/ssh/sshd_config "${backup_dir}/sshd_config"
+    if [ -d /etc/ssh/sshd_config.d ]; then
+        mkdir -p "${backup_dir}/sshd_config.d"
+        cp -a /etc/ssh/sshd_config.d/. "${backup_dir}/sshd_config.d/" 2>/dev/null || true
+    fi
+    if [ -d /etc/systemd/system/ssh.socket.d ]; then
+        had_socket_dir=1
+        mkdir -p "${backup_dir}/ssh.socket.d"
+        cp -a /etc/systemd/system/ssh.socket.d/. "${backup_dir}/ssh.socket.d/" 2>/dev/null || true
+    fi
+    ssh_is_socket_activated && was_socket_active=1
+
+    ssh_rollback() {
+        cp -af "${backup_dir}/sshd_config" /etc/ssh/sshd_config
+        rm -f /etc/ssh/sshd_config.d/00-xm-ssh.conf
+        if [ -d "${backup_dir}/sshd_config.d" ]; then
+            rm -rf /etc/ssh/sshd_config.d
+            mkdir -p /etc/ssh/sshd_config.d
+            cp -a "${backup_dir}/sshd_config.d/." /etc/ssh/sshd_config.d/ 2>/dev/null || true
+        fi
+        rm -f /etc/systemd/system/ssh.socket.d/zz-xm-ssh.conf
+        if [ "$had_socket_dir" -eq 1 ]; then
+            rm -rf /etc/systemd/system/ssh.socket.d
+            mkdir -p /etc/systemd/system/ssh.socket.d
+            cp -a "${backup_dir}/ssh.socket.d/." /etc/systemd/system/ssh.socket.d/ 2>/dev/null || true
+        else
+            rmdir /etc/systemd/system/ssh.socket.d 2>/dev/null || true
+        fi
+        if is_systemd; then
+            systemctl daemon-reload >/dev/null 2>&1 || true
+            if [ "$was_socket_active" -eq 1 ]; then
+                systemctl stop "${svc}.service" >/dev/null 2>&1 || true
+                systemctl restart ssh.socket >/dev/null 2>&1 || true
+                systemctl start "${svc}.service" >/dev/null 2>&1 || true
+            else
+                systemctl restart "${svc}.service" >/dev/null 2>&1 || true
+            fi
+        fi
+        rm -rf "$backup_dir"
+    }
+
+    # 3. 构建规则块并清理旧冲突指令（避免 Port 22 叠加或 PasswordAuthentication yes 先命中生效）
+    local rule_block tmp_file f kbd_line="ChallengeResponseAuthentication no"
+    [ "$supports_kbd" -eq 1 ] && kbd_line="KbdInteractiveAuthentication no"
+    rule_block=$(cat << EOF
+# BEGIN [xm-ssh] Managed by xm ssh
+Port ${new_port}
+PubkeyAuthentication yes
+PasswordAuthentication no
+${kbd_line}
+AuthenticationMethods publickey
+PermitRootLogin ${target_root_login}
+# END [xm-ssh]
+EOF
+)
+
+    for f in /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf; do
+        [ -f "$f" ] || continue
+        [ "$(basename "$f")" = "00-xm-ssh.conf" ] && continue
+        tmp_file=$(mktemp)
+        awk '
+            /# BEGIN \[xm-ssh\]/ { in_blk=1; next }
+            /# END \[xm-ssh\]/ { in_blk=0; next }
+            in_blk { next }
+            /^[[:space:]]*#/{ print; next }
+            tolower($1) ~ /^(port|pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|challengeresponseauthentication|authenticationmethods|permitrootlogin)$/ {
+                print "# [xm-ssh replaced] " $0
+                next
+            }
+            { print }
+        ' "$f" > "$tmp_file"
+        chmod --reference="$f" "$tmp_file" 2>/dev/null || chmod 644 "$tmp_file"
+        mv -f "$tmp_file" "$f"
+    done
+
+    if grep -qiE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' /etc/ssh/sshd_config; then
+        mkdir -p /etc/ssh/sshd_config.d
+        printf '%s\n' "$rule_block" > /etc/ssh/sshd_config.d/00-xm-ssh.conf
+        chmod 644 /etc/ssh/sshd_config.d/00-xm-ssh.conf
+    else
+        tmp_file=$(mktemp)
+        {
+            printf '%s\n\n' "$rule_block"
+            cat /etc/ssh/sshd_config
+        } > "$tmp_file"
+        chmod 644 "$tmp_file"
+        mv -f "$tmp_file" /etc/ssh/sshd_config
+    fi
+
+    # 4. 语法与生效参数校验
+    if ! "$sshd_bin" -t 2>&1; then
+        echo -e "${RED}❌ sshd_config 语法校验失败，已自动回滚全部配置！${PLAIN}"
+        ssh_rollback
+        return 1
+    fi
+
+    local new_eff eff_ports eff_pw eff_pub eff_kbd eff_auth
+    new_eff=$("$sshd_bin" -T 2>/dev/null || true)
+    eff_ports=$(printf '%s\n' "$new_eff" | awk '$1=="port"{print $2}' | tr '\n' ' ' | sed 's/ $//')
+    eff_pw=$(printf '%s\n' "$new_eff" | awk '$1=="passwordauthentication"{print $2; exit}')
+    eff_pub=$(printf '%s\n' "$new_eff" | awk '$1=="pubkeyauthentication"{print $2; exit}')
+    eff_kbd=$(printf '%s\n' "$new_eff" | awk '$1=="kbdinteractiveauthentication" || $1=="challengeresponseauthentication"{print $2; exit}')
+    eff_auth=$(printf '%s\n' "$new_eff" | awk '$1=="authenticationmethods"{print $2; exit}')
+    if [ "$eff_ports" != "$new_port" ] || [ "$eff_pw" != "no" ] || [ "$eff_pub" != "yes" ] || [ "${eff_kbd:-no}" != "no" ] || [ "$eff_auth" != "publickey" ]; then
+        echo -e "${RED}❌ 生效 SSH 配置校验未达预期 (ports='${eff_ports}', pw='${eff_pw}', kbd='${eff_kbd}', pub='${eff_pub}', auth='${eff_auth}')，已自动回滚！${PLAIN}"
+        ssh_rollback
+        return 1
+    fi
+
+    # 5. 应用到 systemd (兼容 Ubuntu 24/26 ssh.socket 激活与传统 ssh/sshd 服务) 或 init
+    if is_systemd; then
+        if [ "$was_socket_active" -eq 1 ]; then
+            mkdir -p /etc/systemd/system/ssh.socket.d
+            {
+                echo "[Socket]"
+                echo "ListenStream="
+                echo "ListenStream=0.0.0.0:${new_port}"
+                [ -f /proc/net/if_inet6 ] && echo "ListenStream=[::]:${new_port}"
+            } > /etc/systemd/system/ssh.socket.d/zz-xm-ssh.conf
+            chmod 644 /etc/systemd/system/ssh.socket.d/zz-xm-ssh.conf
+            systemctl daemon-reload
+            systemctl stop "${svc}.service" 2>/dev/null || true
+            if ! systemctl restart ssh.socket; then
+                echo -e "${RED}❌ 重启 ssh.socket 失败，正在自动回滚！${PLAIN}"
+                ssh_rollback
+                return 1
+            fi
+            systemctl start "${svc}.service" 2>/dev/null || true
+        else
+            systemctl daemon-reload 2>/dev/null || true
+            if ! systemctl restart "${svc}.service"; then
+                echo -e "${RED}❌ 重启 ${svc}.service 失败，正在自动回滚！${PLAIN}"
+                ssh_rollback
+                return 1
+            fi
+        fi
+
+        # 6. 校验新端口已真实处于 LISTEN 状态，否则立即回滚
+        local port_ready=0 _i
+        for _i in 1 2 3 4 5; do
+            if ss -tln 2>/dev/null | grep -qE ":${new_port}[[:space:]]"; then
+                port_ready=1
+                break
+            fi
+            sleep 1
+        done
+        if [ "$port_ready" -ne 1 ]; then
+            echo -e "${RED}❌ 重启后未检测到新端口 ${new_port} 正在监听，已自动回滚以免失联！${PLAIN}"
+            ssh_rollback
+            return 1
+        fi
+    else
+        if command -v service >/dev/null 2>&1; then
+            service "$svc" restart 2>/dev/null || true
+        elif [ -x "/etc/init.d/${svc}" ]; then
+            "/etc/init.d/${svc}" restart 2>/dev/null || true
+        elif pidof sshd >/dev/null 2>&1; then
+            kill -HUP "$(pidof sshd | awk '{print $1}')" 2>/dev/null || true
+        else
+            echo -e "${YELLOW}⚠️ 非 Systemd/受限容器环境，已更新 /etc/ssh 配置，请确认容器管理面板的 SSH 守护方式。${PLAIN}"
+        fi
+    fi
+
+    rm -rf "$backup_dir"
+    local login_user
+    login_user=$(printf '%s\n' "$key_rows" | head -n1 | cut -d: -f1)
+    echo -e "${GREEN}==================================================${PLAIN}"
+    echo -e "${GREEN}🎉 SSH 端口修改与仅密钥登录加固完成！${PLAIN}"
+    echo -e "  - 新 SSH 端口   : ${CYAN}${new_port}/tcp${PLAIN}"
+    echo -e "  - 密码/交互登录 : ${GREEN}已全部关闭${PLAIN}"
+    echo -e "  - 认证方式      : ${GREEN}仅允许 SSH 公钥登录 (AuthenticationMethods publickey)${PLAIN}"
+    echo -e "  - Root 登录策略 : ${CYAN}${target_root_login}${PLAIN}"
+    echo -e "  - 当前可用用户  : ${CYAN}$(printf '%s\n' "$key_rows" | cut -d: -f1 | tr '\n' ' ' | sed 's/ $//')${PLAIN}"
+    echo -e "${YELLOW}--------------------------------------------------${PLAIN}"
+    echo -e "${YELLOW}⚠️ 重要提示（防失联必看）：${PLAIN}"
+    echo -e "  1. 如使用 Oracle / 阿里云 / 腾讯云 / AWS，请先在**云控制台安全组**放行 TCP ${new_port}！"
+    echo -e "  2. 请**不要关闭当前 SSH 窗口**，先新开终端测试以下命令确认能正常登录："
+    echo -e "     ${CYAN}ssh -p ${new_port} ${login_user}@<服务器IP>${PLAIN}"
+    echo -e "${GREEN}==================================================${PLAIN}"
+}
+
+manage_ssh() {
+    local arg1="${1:-}" arg2="${2:-}"
+    case "$arg1" in
+        help|-h|--help)
+            ssh_print_help
+            return 0
+            ;;
+        status)
+            ssh_show_status
+            return 0
+            ;;
+    esac
+
+    local target_port="" auto_yes=0 _a
+    for _a in "$@"; do
+        case "$_a" in
+            --yes|-y) auto_yes=1 ;;
+            *)
+                if [[ "$_a" =~ ^[0-9]+$ ]] && [ "$_a" -ge 1 ] && [ "$_a" -le 65535 ]; then
+                    target_port="$_a"
+                elif [ -n "$_a" ]; then
+                    echo -e "${RED}❌ 无效参数或端口: ${_a}${PLAIN}"
+                    ssh_print_help
+                    return 1
+                fi
+                ;;
+        esac
+    done
+
+    ssh_show_status
+
+    if [ -z "$target_port" ]; then
+        if [ "$auto_yes" -eq 1 ]; then
+            target_port="38291"
+        else
+            while true; do
+                local input_port=""
+                read_tty -p "请输入新的 SSH 端口 [1-65535，默认 38291，输入 0 取消]: " input_port || return 1
+                input_port=$(echo "$input_port" | tr -d ' \r\n')
+                [ "$input_port" = "0" ] && { echo -e "${YELLOW}已取消修改。${PLAIN}"; return 0; }
+                [ -z "$input_port" ] && input_port="38291"
+                if [[ ! "$input_port" =~ ^[0-9]+$ ]] || [ "$input_port" -lt 1 ] || [ "$input_port" -gt 65535 ]; then
+                    echo -e "${RED}❌ 端口必须是 1-65535 之间的整数！${PLAIN}"
+                    continue
+                fi
+                local conflict=""
+                if conflict=$(ssh_check_port_conflict "$input_port"); then
+                    echo -e "${RED}❌ 端口 ${input_port}/tcp 已被其他服务占用: ${conflict}${PLAIN}"
+                    continue
+                fi
+                target_port="$input_port"
+                break
+            done
+        fi
+    fi
+
+    local key_rows
+    key_rows=$(ssh_collect_authorized_keys || true)
+    if [ -z "$key_rows" ]; then
+        if [ "$auto_yes" -eq 1 ]; then
+            echo -e "${RED}❌ 未在任何账户检测到 SSH 公钥，禁止 --yes 盲目关闭密码登录！${PLAIN}"
+            return 1
+        fi
+        ssh_prompt_install_pubkey || return 1
+    fi
+
+    if [ "$auto_yes" -ne 1 ]; then
+        echo -e "\n${CYAN}即将执行以下 SSH 安全修改：${PLAIN}"
+        echo -e "  - 更改 SSH 监听端口为 : ${GREEN}${target_port}/tcp${PLAIN} (自动放行本机防火墙)"
+        echo -e "  - 关闭密码登录        : ${GREEN}是（仅允许 SSH 公钥登录）${PLAIN}"
+        echo -e "${YELLOW}  (若使用云服务器，请确认云面板安全组已放行 ${target_port}/tcp)${PLAIN}"
+        local confirm=""
+        read_tty -p "确认立即应用？[Y/n]: " confirm || return 1
+        if [[ "$confirm" == "n" || "$confirm" == "N" ]]; then
+            echo -e "${YELLOW}已取消修改。${PLAIN}"
+            return 0
+        fi
+    fi
+
+    apply_ssh_hardening "$target_port"
+}
+
 menu() {
     while true; do
         load_tunnel_meta
@@ -1966,11 +2526,12 @@ menu() {
             echo -e " ${GREEN}15.${PLAIN} 管理 Cloudflare WARP 客户端 (warp) ${YELLOW}[未安装]${PLAIN}"
         fi
         echo -e " ${GREEN}16.${PLAIN} 更新 xm 管理脚本到最新版 (update-script)"
+        echo -e " ${GREEN}17.${PLAIN} SSH 端口修改与仅密钥登录加固 (ssh)"
         echo -e "--------------------------------------------------"
-        echo -e " ${RED}17.${PLAIN} 彻底卸载清理组件 (uninstall)"
+        echo -e " ${RED}18.${PLAIN} 彻底卸载清理组件 (uninstall)"
         echo -e " ${YELLOW}0.${PLAIN} 退出菜单"
         echo -e "${BLUE}==================================================${PLAIN}"
-        read_tty -p "请输入选项 [0-17]: " choice
+        read_tty -p "请输入选项 [0-18]: " choice
         case "$choice" in
             1) show_info ;;
             2) start_xray ;;
@@ -1994,7 +2555,8 @@ menu() {
             14) manage_cert ;;
             15) manage_warp ;;
             16) update_xm_script 1 ;;
-            17) uninstall_xray ;;
+            17) manage_ssh ;;
+            18) uninstall_xray ;;
             0) exit 0 ;;
             *) echo -e "${RED}输入无效，请重新输入！${PLAIN}" ;;
         esac
@@ -2032,6 +2594,7 @@ case "${1:-}" in
     geo-cron) set_geo_schedule_cli "${2:-}" "${3:-}" "${4:-}" ;;
     test) test_config ;;
     bbr) enable_bbr ;;
+    ssh|ssh-port) shift; manage_ssh "$@" ;;
     uninstall|del) shift; uninstall_xray "$@" ;;
     *) menu ;;
 esac

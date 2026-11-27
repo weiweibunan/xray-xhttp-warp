@@ -126,6 +126,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/weiweibunan/xray-xhttp-warp/
 | `xm token` | 更新 Cloudflare Tunnel Token 密钥与域名（纯隧道模式 / 已开启附加隧道时） |
 | `xm cert` | 证书管理（`xm cert status` 查看、`xm cert issue` 申请/更换并应用、`xm cert renew` 强制续期） |
 | `xm bbr` | 一键开启/检查系统 TCP BBR 拥塞控制加速 |
+| `xm ssh [端口]` | 修改 SSH 端口（默认 `38291`）、放行本机防火墙，并关闭密码强制仅密钥登录 |
 | `xm update-core` | 比对版本并校验 SHA256 升级 Xray 官方最新核心 |
 | `xm update-geo` | 从 [Loyalsoldier/v2ray-rules-dat](https://github.com/Loyalsoldier/v2ray-rules-dat) 校验 SHA256 增量升级 `geosite.dat` / `geoip.dat` |
 | `xm geo-cron` | 设置/查看/关闭规则库定时自动更新（`daily` / `weekly` / `days <N>` / `off`） |
