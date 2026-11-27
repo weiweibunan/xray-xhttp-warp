@@ -384,9 +384,11 @@ stop_proc_graceful() {
 start_xray() {
     load_tunnel_meta
     if is_systemd; then
+        systemctl reset-failed xray >/dev/null 2>&1 || true
         systemctl start xray
         if is_tunnel_active; then
             ensure_tunnel_env_file
+            systemctl reset-failed cloudflared >/dev/null 2>&1 || true
             systemctl start cloudflared
         fi
     else
@@ -420,9 +422,11 @@ restart_xray() {
     fi
     load_tunnel_meta
     if is_systemd; then
+        systemctl reset-failed xray >/dev/null 2>&1 || true
         systemctl restart xray
         if is_tunnel_active; then
             ensure_tunnel_env_file
+            systemctl reset-failed cloudflared >/dev/null 2>&1 || true
             systemctl restart cloudflared 2>/dev/null || true
         fi
     else
