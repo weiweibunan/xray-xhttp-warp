@@ -1989,6 +1989,12 @@ ssh_find_sshd_bin() {
     command -v sshd 2>/dev/null || true
 }
 
+ssh_ensure_privsep_dir() {
+    if [ ! -d /run/sshd ]; then
+        mkdir -p /run/sshd 2>/dev/null && chmod 0755 /run/sshd 2>/dev/null || true
+    fi
+}
+
 ssh_detect_service_name() {
     if is_systemd; then
         if systemctl cat ssh.service >/dev/null 2>&1; then
@@ -2086,6 +2092,7 @@ ssh_show_status() {
     echo -e "${GREEN}           SSH 端口与安全策略状态                 ${PLAIN}"
     echo -e "${BLUE}==================================================${PLAIN}"
     if [ -n "$sshd_bin" ]; then
+        ssh_ensure_privsep_dir
         local eff ports pw kbd pub root_login auth_methods
         eff=$("$sshd_bin" -T 2>/dev/null || true)
         ports=$(printf '%s\n' "$eff" | awk '$1=="port"{print $2}' | tr '\n' ' ' | sed 's/ $//')
@@ -2194,6 +2201,7 @@ apply_ssh_hardening() {
     fi
 
     local has_nonroot_key=0 cur_eff supports_kbd=0 cur_root_login="" target_root_login="prohibit-password"
+    ssh_ensure_privsep_dir
     while IFS=: read -r u _ _; do
         [ -n "$u" ] && [ "$u" != "root" ] && has_nonroot_key=1
     done <<< "$key_rows"
