@@ -2024,6 +2024,7 @@ ssh_collect_authorized_keys() {
         fi
         cnt=$(awk '
             /^[[:space:]]*(#|$)/ { next }
+            /command="echo '\''Please login as / { next }
             /(^|[[:space:]])(ssh-(rsa|ed25519|dss)|ecdsa-sha2-nistp(256|384|521)|sk-(ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com)[[:space:]]+[A-Za-z0-9+\/=]+/ { c++ }
             END { print c + 0 }
         ' "$auth_file" 2>/dev/null || echo 0)
@@ -2382,8 +2383,13 @@ EOF
     fi
 
     rm -rf "$backup_dir"
-    local login_user
-    login_user=$(printf '%s\n' "$key_rows" | head -n1 | cut -d: -f1)
+    local login_user=""
+    if [ -n "${SUDO_USER:-}" ] && printf '%s\n' "$key_rows" | grep -q "^${SUDO_USER}:"; then
+        login_user="$SUDO_USER"
+    else
+        login_user=$(printf '%s\n' "$key_rows" | awk -F: '$1 != "root" {print $1; exit}')
+        [ -z "$login_user" ] && login_user=$(printf '%s\n' "$key_rows" | head -n1 | cut -d: -f1)
+    fi
     echo -e "${GREEN}==================================================${PLAIN}"
     echo -e "${GREEN}🎉 SSH 端口修改与仅密钥登录加固完成！${PLAIN}"
     echo -e "  - 新 SSH 端口   : ${CYAN}${new_port}/tcp${PLAIN}"
