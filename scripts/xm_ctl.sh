@@ -1400,6 +1400,14 @@ route_jq_prelude() {
     cat << 'JQ'
 def uniq_keep:
   reduce .[] as $x ([]; if index($x) then . else . + [$x] end);
+def sync_ip_catchall:
+  if (.routing.domainStrategy == "IPIfNonMatch") and ((.outbounds[0].tag // "") == "direct") then
+    .routing.rules |= map(select(not (.outboundTag == "direct" and .network == "tcp,udp" and (([keys[] | select(. != "type" and . != "outboundTag" and . != "balancerTag" and . != "ruleTag")] | length) == 1))))
+  elif (.routing.domainStrategy == "AsIs") and ((.outbounds[0].tag // "") == "direct") and ([(.routing.rules // [])[] | select(.outboundTag == "direct" and .network == "tcp,udp" and (([keys[] | select(. != "type" and . != "outboundTag" and . != "balancerTag" and . != "ruleTag")] | length) == 1))] | length == 0) then
+    .routing.rules += [{"type":"field","outboundTag":"direct","network":"tcp,udp"}]
+  else
+    .
+  end;
 def ensure_warp_ipv4:
   if ([.outbounds[]? | select(.tag == "warp-ipv4-out")] | length) > 0 then
     .
@@ -1488,6 +1496,9 @@ route_list() {
         (if .value.network? then "network=" + .value.network else empty end)
       ] as $parts
       | "  [\(.key + 1)] -> \(.value.outboundTag): \(if ($parts | length) > 0 then ($parts | join(" & ")) else "all" end)\(if (.value.outboundTag=="direct" and (.value.network? == "tcp,udp") and ($parts | length) == 1) then " (默认兜底)" elif (.value.outboundTag=="block" and (.value.ip? == ["geoip:private"]) and ($parts | length) == 1) then " (默认保护)" else "" end)"' "$CONFIG"
+    if jq -e '((.outbounds[0].tag // "") == "direct") and ([(.routing.rules // [])[] | select(.outboundTag == "direct" and .network == "tcp,udp" and (([keys[] | select(. != "type" and . != "outboundTag" and . != "balancerTag" and . != "ruleTag")] | length) == 1))] | length == 0)' "$CONFIG" >/dev/null 2>&1; then
+        echo "  [*] -> direct: 未匹配流量默认直连 (outbounds[0])"
+    fi
 }
 
 route_tokenize_args() {
@@ -1636,14 +1647,25 @@ route_set_strategy() {
         esac
     fi
 
-    local cur
+    local cur has_catchall=0
     cur=$(jq -r '.routing.domainStrategy // "AsIs"' "$CONFIG" 2>/dev/null || echo "AsIs")
-    if [ "$cur" = "$target" ]; then
+    jq -e '([(.routing.rules // [])[] | select(.outboundTag == "direct" and .network == "tcp,udp" and (([keys[] | select(. != "type" and . != "outboundTag" and . != "balancerTag" and . != "ruleTag")] | length) == 1))] | length) > 0' "$CONFIG" >/dev/null 2>&1 && has_catchall=1
+    if [ "$cur" = "$target" ] && { [ "$target" != "IPIfNonMatch" ] || [ "$has_catchall" -eq 0 ]; }; then
         echo -e "${YELLOW}ℹ️ 当前解析策略已是 ${target}，无需修改。${PLAIN}"
         return 0
     fi
-    if route_apply_jq '.routing.domainStrategy = $st' --arg st "$target"; then
+    local jq_prog
+    jq_prog=$(
+        route_jq_prelude
+        cat << 'JQ'
+    .routing.domainStrategy = $st | sync_ip_catchall
+JQ
+)
+    if route_apply_jq "$jq_prog" --arg st "$target"; then
         echo -e "${GREEN}✅ routing.domainStrategy 已切换为 ${target} 并重载 Xray！${PLAIN}"
+        if [ "$target" = "IPIfNonMatch" ] && [ "$has_catchall" -eq 1 ]; then
+            echo -e "${CYAN}ℹ️ 已自动移除阻塞 IPIfNonMatch 二次 DNS 匹配的末位 direct (tcp,udp) 规则（未匹配流量仍默认走 outbounds[0]: direct）。${PLAIN}"
+        fi
     fi
 }
 
@@ -1777,6 +1799,7 @@ route_add() {
             end
         )
       )
+    | sync_ip_catchall
 JQ
 )
 
@@ -1871,6 +1894,7 @@ route_combo() {
             | if $ins != null then .[:$ins] + [$nr] + .[$ins:] else . + [$nr] end
           end
       )
+    | sync_ip_catchall
 JQ
 )
 
