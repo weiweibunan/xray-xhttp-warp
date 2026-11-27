@@ -52,6 +52,26 @@
       "protocol": "freedom"
     },
     {
+      "tag": "warp-ipv6-out",
+      "protocol": "freedom",
+      "streamSettings": {
+        "sockopt": {
+          "domainStrategy": "ForceIPv6",
+          "dialerProxy": "warp-out"
+        }
+      }
+    },
+    {
+      "tag": "warp-ipv4-out",
+      "protocol": "freedom",
+      "streamSettings": {
+        "sockopt": {
+          "domainStrategy": "ForceIPv4",
+          "dialerProxy": "warp-out"
+        }
+      }
+    },
+    {
       "tag": "warp-out",
       "protocol": "wireguard",
       "settings": {
@@ -68,11 +88,6 @@
           }
         ],
         "mtu": 1280
-      },
-      "streamSettings": {
-        "sockopt": {
-          "domainStrategy": "ForceIPv6"
-        }
       }
     },
     {
@@ -92,7 +107,7 @@
       },
       {
         "type": "field",
-        "outboundTag": "warp-out",
+        "outboundTag": "warp-ipv6-out",
         "domain": [
           "geosite:openai",
           "geosite:google-deepmind"

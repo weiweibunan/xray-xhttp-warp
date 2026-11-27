@@ -262,7 +262,7 @@ show_info() {
         fi
 
         if [ "$WARP_ENABLED" = "1" ]; then
-            warp_desc="${YELLOW}OpenAI + Gemini -> Cloudflare WARP (WireGuard ForceIPv6)${PLAIN}"
+            warp_desc="${YELLOW}OpenAI/Gemini -> warp-ipv6-out | 按需 -> warp-ipv4-out (WARP WireGuard)${PLAIN}"
         else
             warp_desc="${YELLOW}已退化为容器直连 (未检测到有效 WARP 凭据)${PLAIN}"
         fi
@@ -333,7 +333,7 @@ show_info() {
     echo -e "  服务器公网 IP : ${CYAN}${ip}${PLAIN}"
     echo -e "  SNI 证书域名  : ${CYAN}${sni}${PLAIN}"
     echo -e "  用户 UUID     : ${CYAN}${uuid}${PLAIN}"
-    echo -e "  分流出站配置  : ${YELLOW}OpenAI + Gemini -> ForceIPv6 -> 127.0.0.1:40000${PLAIN}"
+    echo -e "  分流出站配置  : ${YELLOW}OpenAI/Gemini -> warp-ipv6-out | 按需 -> warp-ipv4-out (WARP ForceIPv4) | 其余 -> direct${PLAIN}"
     echo -e "${BLUE}==================================================${PLAIN}"
     echo -e "${GREEN}🌐 节点 1：【VLESS - XHTTP - CDN 优选节点】${PLAIN}(防封/CDN加速)"
     echo -e "${YELLOW}vless://${uuid}@${CDN_HOST}:${port_xc}?encryption=none&security=tls&sni=${sni}&host=${sni}&type=xhttp&path=${path_xc}&mode=auto#XHTTP-CDN-Shopify${PLAIN}"
@@ -1105,6 +1105,326 @@ convert_cron_to_oncalendar() {
     return 1
 }
 
+route_normalize_target() {
+    local raw="${1:-}"
+    case "$raw" in
+        v4|ipv4|warp-v4|warp4|warp-ipv4|warp-ipv4-out) echo "warp-ipv4-out" ;;
+        v6|ipv6|warp-v6|warp6|warp-ipv6|warp-ipv6-out) echo "warp-ipv6-out" ;;
+        direct|vps) echo "direct" ;;
+        *) return 1 ;;
+    esac
+}
+
+route_normalize_domain() {
+    local item
+    item=$(echo "${1:-}" | tr -d ' \t\r\n')
+    [ -z "$item" ] && return 1
+    case "$item" in
+        domain:*|full:*|geosite:*|keyword:*|regexp:*)
+            echo "$item"
+            ;;
+        *)
+            item="${item#http://}"
+            item="${item#https://}"
+            item="${item%%/*}"
+            item="${item%%:*}"
+            item=$(echo "$item" | tr '[:upper:]' '[:lower:]')
+            item="${item#.}"
+            [ -z "$item" ] && return 1
+            echo "domain:${item}"
+            ;;
+    esac
+}
+
+route_apply_jq() {
+    local jq_expr="$1"
+    shift
+    [ -f "$CONFIG" ] || { echo -e "${RED}❌ 未找到配置文件 $CONFIG${PLAIN}"; return 1; }
+    if ! command -v jq >/dev/null 2>&1; then
+        echo -e "${RED}❌ 当前系统缺少 jq，无法安全修改路由配置！${PLAIN}"
+        return 1
+    fi
+
+    local tmp_dir tmp_cfg
+    tmp_dir=$(mktemp -d)
+    tmp_cfg="${tmp_dir}/config.json"
+    if ! jq "$@" "$jq_expr" "$CONFIG" > "$tmp_cfg" 2>/dev/null; then
+        rm -rf "$tmp_dir"
+        echo -e "${RED}❌ 生成新路由配置失败！${PLAIN}"
+        return 1
+    fi
+    if ! XRAY_LOCATION_ASSET="$XRAY_ASSET_DIR" "$XRAY_BIN" run -test -c "$tmp_cfg" >/dev/null 2>&1; then
+        XRAY_LOCATION_ASSET="$XRAY_ASSET_DIR" "$XRAY_BIN" run -test -c "$tmp_cfg" || true
+        rm -rf "$tmp_dir"
+        echo -e "${RED}❌ Xray 配置校验失败，已自动回滚未做任何更改！${PLAIN}"
+        return 1
+    fi
+    chmod 644 "$tmp_cfg"
+    mv -f "$tmp_cfg" "$CONFIG"
+    rm -rf "$tmp_dir"
+    restart_xray
+    return 0
+}
+
+route_jq_prelude() {
+    cat << 'JQ'
+def uniq_keep:
+  reduce .[] as $x ([]; if index($x) then . else . + [$x] end);
+def ensure_warp_ipv4:
+  if ([.outbounds[]? | select(.tag == "warp-ipv4-out")] | length) > 0 then
+    .
+  elif ([.outbounds[]? | select(.tag == "socks-warp")] | length) > 0 then
+    if ([.outbounds[]? | select(.tag == "warp-ipv6-out")] | length) > 0 then
+      .outbounds |= reduce .[] as $o ([]; . + [$o] + (if $o.tag == "warp-ipv6-out" then [{
+        "tag": "warp-ipv4-out",
+        "protocol": "freedom",
+        "streamSettings": {"sockopt": {"domainStrategy": "ForceIPv4", "dialerProxy": "socks-warp"}}
+      }] else [] end))
+    else
+      .outbounds += [{
+        "tag": "warp-ipv4-out",
+        "protocol": "freedom",
+        "streamSettings": {"sockopt": {"domainStrategy": "ForceIPv4", "dialerProxy": "socks-warp"}}
+      }]
+    end
+  elif ([.outbounds[]? | select(.protocol == "wireguard")] | length) > 0 then
+    ([.outbounds[]? | select(.protocol == "wireguard") | .tag] | .[0]) as $wg_old
+    | (if $wg_old == "warp-ipv6-out" then "warp-out" else $wg_old end) as $wg_tag
+    | ([.outbounds[]? | select(.tag == "warp-ipv6-out" and .protocol == "freedom")] | length > 0) as $has_v6_freedom
+    | .outbounds |= (
+        ((if $has_v6_freedom then [] else [{
+          "tag": "warp-ipv6-out",
+          "protocol": "freedom",
+          "streamSettings": {"sockopt": {"domainStrategy": "ForceIPv6", "dialerProxy": $wg_tag}}
+        }] end) + [{
+          "tag": "warp-ipv4-out",
+          "protocol": "freedom",
+          "streamSettings": {"sockopt": {"domainStrategy": "ForceIPv4", "dialerProxy": $wg_tag}}
+        }]) as $new_freedoms
+        | reduce .[] as $o ([];
+            if $o.protocol == "wireguard" and $o.tag == $wg_old then
+              ($o
+                | .tag = $wg_tag
+                | if .streamSettings.sockopt? then (.streamSettings.sockopt |= del(.domainStrategy)) else . end
+                | if (.streamSettings.sockopt? == {}) then (.streamSettings |= del(.sockopt)) else . end
+                | if (.streamSettings? == {}) then del(.streamSettings) else . end
+              ) as $wg_clean
+              | . + $new_freedoms + [$wg_clean]
+            else
+              . + [$o]
+            end
+          )
+      )
+    | .routing.rules |= map(if .outboundTag == "warp-out" then .outboundTag = "warp-ipv6-out" else . end)
+  else
+    .
+  end;
+JQ
+}
+
+route_ensure_warp_v4() {
+    [ -f "$CONFIG" ] || { echo -e "${RED}❌ 未找到配置文件 $CONFIG${PLAIN}"; return 1; }
+    if jq -e '.outbounds[]? | select(.tag == "warp-ipv4-out")' "$CONFIG" >/dev/null 2>&1; then
+        echo -e "${GREEN}✅ 当前配置已包含 warp-ipv4-out 出站。${PLAIN}"
+        return 0
+    fi
+    local jq_prog
+    jq_prog="$(route_jq_prelude) ensure_warp_ipv4"
+    if route_apply_jq "$jq_prog"; then
+        echo -e "${GREEN}✅ 已自动补全 warp-ipv4-out (ForceIPv4 via WARP) 出站并重载 Xray！${PLAIN}"
+    fi
+}
+
+route_list() {
+    [ -f "$CONFIG" ] || { echo -e "${RED}❌ 未找到配置文件 $CONFIG${PLAIN}"; return 1; }
+    if ! command -v jq >/dev/null 2>&1; then
+        echo -e "${RED}❌ 当前系统缺少 jq，无法解析路由列表！${PLAIN}"
+        return 1
+    fi
+    echo -e "${CYAN}=== 当前出站 (Outbounds) ===${PLAIN}"
+    jq -r '.outbounds[]? | "  - \(.tag) (\(.protocol)\(if .streamSettings.sockopt.domainStrategy? then ", \(.streamSettings.sockopt.domainStrategy)" else "" end)\(if .streamSettings.sockopt.dialerProxy? then " -> \(.streamSettings.sockopt.dialerProxy)" else "" end))"' "$CONFIG"
+    echo -e "${CYAN}=== 当前分流规则 (Routing Rules) ===${PLAIN}"
+    jq -r '(.routing.rules // []) | to_entries[] | "  [\(.key + 1)] -> \(.value.outboundTag): \(if .value.domain? then (.value.domain | join(", ")) elif .value.ip? then ("ip=" + (.value.ip | join(", "))) elif .value.network? then ("network=" + .value.network + " (默认兜底)") else "all" end)"' "$CONFIG"
+}
+
+route_add() {
+    local target_raw="${1:-}"
+    [ $# -gt 0 ] && shift
+    local target
+    if [ -z "$target_raw" ]; then
+        read_tty -p "选择目标出口 [v4=WARP IPv4 / v6=WARP IPv6 / direct=VPS直连] (默认 v4): " target_raw || return 0
+        [ -z "$target_raw" ] && target_raw="v4"
+    fi
+    target=$(route_normalize_target "$target_raw") || {
+        echo -e "${RED}❌ 不支持的出口标识: ${target_raw} (可选: v4, v6, direct)${PLAIN}"
+        return 1
+    }
+
+    local raw_inputs=()
+    if [ $# -gt 0 ]; then
+        raw_inputs=("$@")
+    else
+        local line=""
+        read_tty -p "请输入域名 (空格或逗号分隔, 如 paytr.com oyunfor.com): " line || return 0
+        line="${line//,/ }"
+        read -r -a raw_inputs <<< "$line"
+    fi
+
+    local norm_domains=() item part norm
+    for item in "${raw_inputs[@]}"; do
+        for part in ${item//,/ }; do
+            norm=$(route_normalize_domain "$part") || continue
+            norm_domains+=("$norm")
+        done
+    done
+    if [ ${#norm_domains[@]} -eq 0 ]; then
+        echo -e "${RED}❌ 未提供有效的域名规则！${PLAIN}"
+        return 1
+    fi
+
+    local items_json
+    items_json=$(printf '%s\n' "${norm_domains[@]}" | jq -R . | jq -s .)
+    local jq_prog
+    jq_prog="$(route_jq_prelude)
+    (if (\$tag == \"warp-ipv4-out\" or \$tag == \"warp-ipv6-out\") then ensure_warp_ipv4 else . end)
+    | .routing.rules |= (
+        (. // [])
+        | map(
+            if .outboundTag != \$tag and (.domain | type == \"array\") then
+              .domain |= (. - \$items)
+            else . end
+          )
+        | map(select((.domain | type != \"array\") or (.domain | length > 0)))
+        | ([to_entries[] | select(.value.outboundTag == \$tag and (.value.domain | type == \"array\")) | .key] | .[0]) as \$idx
+        | if \$idx != null then
+            .[\$idx].domain = ((.[\$idx].domain + \$items) | uniq_keep)
+          else
+            ({ \"type\": \"field\", \"outboundTag\": \$tag, \"domain\": (\$items | uniq_keep) }) as \$new_rule
+            | (if \$tag == \"direct\" then
+                 ([to_entries[] | select(.value.outboundTag != \"block\") | .key] | .[0])
+               else
+                 ([to_entries[] | select(.value.outboundTag == \"direct\" and (.value.domain == null) and (.value.ip == null)) | .key] | .[0])
+               end) as \$ins
+            | if \$ins != null then
+                .[:\$ins] + [\$new_rule] + .[\$ins:]
+              else
+                . + [\$new_rule]
+              end
+          end
+      )"
+
+    if route_apply_jq "$jq_prog" --arg tag "$target" --argjson items "$items_json"; then
+        echo -e "${GREEN}✅ 已将以下规则加入 [${target}]: ${norm_domains[*]}${PLAIN}"
+    fi
+}
+
+route_del() {
+    local target_raw="${1:-}"
+    [ $# -gt 0 ] && shift
+    local target=""
+    if [ -n "$target_raw" ]; then
+        if target=$(route_normalize_target "$target_raw" 2>/dev/null); then
+            :
+        else
+            # 若第一个参数直接就是域名，则允许从所有规则中删除
+            set -- "$target_raw" "$@"
+            target=""
+        fi
+    fi
+
+    local raw_inputs=()
+    if [ $# -gt 0 ]; then
+        raw_inputs=("$@")
+    else
+        local line=""
+        read_tty -p "请输入要移除的域名 (空格或逗号分隔, 如 paytr.com): " line || return 0
+        line="${line//,/ }"
+        read -r -a raw_inputs <<< "$line"
+    fi
+
+    local del_candidates=() item part stripped norm
+    for item in "${raw_inputs[@]}"; do
+        for part in ${item//,/ }; do
+            stripped=$(echo "$part" | tr -d ' \t\r\n')
+            [ -z "$stripped" ] && continue
+            del_candidates+=("$stripped")
+            if norm=$(route_normalize_domain "$stripped" 2>/dev/null); then
+                del_candidates+=("$norm")
+            fi
+        done
+    done
+    if [ ${#del_candidates[@]} -eq 0 ]; then
+        echo -e "${RED}❌ 未提供要移除的域名！${PLAIN}"
+        return 1
+    fi
+
+    local items_json
+    items_json=$(printf '%s\n' "${del_candidates[@]}" | jq -R . | jq -s 'unique')
+    local jq_prog='
+    .routing.rules |= (
+      (. // [])
+      | map(
+          if ($tag == "" or .outboundTag == $tag) and (.domain | type == "array") then
+            .domain |= (. - $items)
+          else . end
+        )
+      | map(select((.domain | type != "array") or (.domain | length > 0)))
+    )'
+
+    if route_apply_jq "$jq_prog" --arg tag "$target" --argjson items "$items_json"; then
+        echo -e "${GREEN}✅ 已更新分流规则并重载 Xray！${PLAIN}"
+    fi
+}
+
+manage_routes() {
+    local action="${1:-}"
+    [ $# -gt 0 ] && shift
+    case "$action" in
+        list|ls|show)
+            route_list
+            ;;
+        ensure|init|upgrade)
+            route_ensure_warp_v4
+            ;;
+        add)
+            route_add "$@"
+            ;;
+        del|rm|remove|delete)
+            route_del "$@"
+            ;;
+        "")
+            route_list || true
+            echo ""
+            echo -e "${CYAN}分流路由管理 (Xray Outbound & Routing):${PLAIN}"
+            echo -e "  ${GREEN}1.${PLAIN} 添加域名走 WARP IPv4 出口 (${CYAN}warp-ipv4-out${PLAIN})"
+            echo -e "  ${GREEN}2.${PLAIN} 添加域名走 WARP IPv6 出口 (${CYAN}warp-ipv6-out${PLAIN})"
+            echo -e "  ${GREEN}3.${PLAIN} 添加域名走 VPS 直连出口 (${CYAN}direct${PLAIN})"
+            echo -e "  ${GREEN}4.${PLAIN} 移除已添加的分流域名"
+            echo -e "  ${GREEN}5.${PLAIN} 为旧配置自动补全 warp-ipv4-out 出站"
+            echo -e "  ${GREEN}0.${PLAIN} 返回主菜单"
+            local choice=""
+            read_tty -p "请选择 [0-5]: " choice || return 0
+            case "$choice" in
+                1) route_add "v4" ;;
+                2) route_add "v6" ;;
+                3) route_add "direct" ;;
+                4) route_del ;;
+                5) route_ensure_warp_v4 ;;
+                0|"") return 0 ;;
+                *) echo -e "${RED}无效选项${PLAIN}"; return 1 ;;
+            esac
+            ;;
+        *)
+            echo "用法:"
+            echo "  xm route list                         查看当前出站与分流规则"
+            echo "  xm route ensure                       为旧配置补全 warp-ipv4-out 出站"
+            echo "  xm route add <v4|v6|direct> <域名...> 添加域名分流 (如: xm route add v4 paytr.com oyunfor.com)"
+            echo "  xm route del [v4|v6|direct] <域名...> 移除域名分流 (如: xm route del paytr.com)"
+            return 1
+            ;;
+    esac
+}
+
 apply_geo_schedule() {
     local on_cal="$1"
     local cron_expr="$2"
@@ -1605,7 +1925,7 @@ warp_show_container_wireguard() {
         echo -e "  WARP IPv6: ${CYAN}$(jq -r '.v6 // "未知"' /etc/xray/warp-tunnel.json 2>/dev/null)${PLAIN}"
         echo -e "  Endpoint : ${CYAN}$(jq -r '.endpoint_v4 // .endpoint_v6 // "未知"' /etc/xray/warp-tunnel.json 2>/dev/null)${PLAIN}"
     elif [ -f "$CONFIG" ] && command -v jq >/dev/null 2>&1; then
-        echo -e "  Endpoint : ${CYAN}$(jq -r '.outbounds[]? | select(.tag=="warp-ipv6-out") | .settings.peers[0].endpoint // "未知"' "$CONFIG" 2>/dev/null)${PLAIN}"
+        echo -e "  Endpoint : ${CYAN}$(jq -r '.outbounds[]? | select(.protocol=="wireguard" or .tag=="warp-ipv6-out") | .settings.peers[0].endpoint // "未知"' "$CONFIG" 2>/dev/null | head -n 1)${PLAIN}"
     fi
     echo -e "  分流规则 : ${GREEN}geosite:openai, geosite:google-deepmind -> warp-ipv6-out${PLAIN}"
     echo -e "${BLUE}==================================================${PLAIN}"
@@ -2541,11 +2861,12 @@ menu() {
         fi
         echo -e " ${GREEN}16.${PLAIN} 更新 xm 管理脚本到最新版 (update-script)"
         echo -e " ${GREEN}17.${PLAIN} SSH 端口修改与仅密钥登录加固 (ssh)"
+        echo -e " ${GREEN}18.${PLAIN} 管理分流路由与 WARP IPv4 出口 (route)"
         echo -e "--------------------------------------------------"
-        echo -e " ${RED}18.${PLAIN} 彻底卸载清理组件 (uninstall)"
+        echo -e " ${RED}19.${PLAIN} 彻底卸载清理组件 (uninstall)"
         echo -e " ${YELLOW}0.${PLAIN} 退出菜单"
         echo -e "${BLUE}==================================================${PLAIN}"
-        read_tty -p "请输入选项 [0-18]: " choice
+        read_tty -p "请输入选项 [0-19]: " choice
         case "$choice" in
             1) show_info ;;
             2) start_xray ;;
@@ -2570,7 +2891,8 @@ menu() {
             15) manage_warp ;;
             16) update_xm_script 1 ;;
             17) manage_ssh ;;
-            18) uninstall_xray ;;
+            18) manage_routes ;;
+            19) uninstall_xray ;;
             0) exit 0 ;;
             *) echo -e "${RED}输入无效，请重新输入！${PLAIN}" ;;
         esac
@@ -2609,6 +2931,7 @@ case "${1:-}" in
     test) test_config ;;
     bbr) enable_bbr ;;
     ssh|ssh-port) shift; manage_ssh "$@" ;;
+    route|routes) shift; manage_routes "$@" ;;
     uninstall|del) shift; uninstall_xray "$@" ;;
     *) menu ;;
 esac

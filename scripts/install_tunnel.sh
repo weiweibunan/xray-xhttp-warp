@@ -279,6 +279,26 @@ if [ "$WARP_READY" = "true" ]; then
     [ -n "$WARP_RESERVED_JSON" ] && RESERVED_LINE="\"reserved\": ${WARP_RESERVED_JSON},"
 
     WARP_OUTBOUND_JSON="{
+      \"tag\": \"warp-ipv6-out\",
+      \"protocol\": \"freedom\",
+      \"streamSettings\": {
+        \"sockopt\": {
+          \"domainStrategy\": \"ForceIPv6\",
+          \"dialerProxy\": \"warp-out\"
+        }
+      }
+    },
+    {
+      \"tag\": \"warp-ipv4-out\",
+      \"protocol\": \"freedom\",
+      \"streamSettings\": {
+        \"sockopt\": {
+          \"domainStrategy\": \"ForceIPv4\",
+          \"dialerProxy\": \"warp-out\"
+        }
+      }
+    },
+    {
       \"tag\": \"warp-out\",
       \"protocol\": \"wireguard\",
       \"settings\": {
@@ -296,16 +316,11 @@ if [ "$WARP_READY" = "true" ]; then
           }
         ],
         \"mtu\": 1280
-      },
-      \"streamSettings\": {
-        \"sockopt\": {
-          \"domainStrategy\": \"ForceIPv6\"
-        }
       }
     },"
     WARP_ROUTING_RULE='{
         "type": "field",
-        "outboundTag": "warp-out",
+        "outboundTag": "warp-ipv6-out",
         "domain": [
           "geosite:openai",
           "geosite:google-deepmind"

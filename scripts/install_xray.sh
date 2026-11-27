@@ -261,6 +261,16 @@ cat > "$TMP_CFG" << JSON
       }
     },
     {
+      "tag": "warp-ipv4-out",
+      "protocol": "freedom",
+      "streamSettings": {
+        "sockopt": {
+          "domainStrategy": "ForceIPv4",
+          "dialerProxy": "socks-warp"
+        }
+      }
+    },
+    {
       "tag": "socks-warp",
       "protocol": "socks",
       "settings": {

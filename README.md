@@ -127,6 +127,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/weiweibunan/xray-xhttp-warp/
 | `xm cert` | 证书管理（`xm cert status` 查看、`xm cert issue` 申请/更换并应用、`xm cert renew` 强制续期） |
 | `xm bbr` | 一键开启/检查系统 TCP BBR 拥塞控制加速 |
 | `xm ssh [端口]` | 修改 SSH 端口（默认 `38291`）、放行本机防火墙，并关闭密码强制仅密钥登录 |
+| `xm route` | 管理 Xray 域名分流规则与 `warp-ipv4-out`（`ForceIPv4`）出口（`list` / `ensure` / `add v4 <域名>` / `del <域名>`） |
 | `xm update-core` | 比对版本并校验 SHA256 升级 Xray 官方最新核心 |
 | `xm update-geo` | 从 [Loyalsoldier/v2ray-rules-dat](https://github.com/Loyalsoldier/v2ray-rules-dat) 校验 SHA256 增量升级 `geosite.dat` / `geoip.dat` |
 | `xm geo-cron` | 设置/查看/关闭规则库定时自动更新（`daily` / `weekly` / `days <N>` / `off`） |
@@ -174,7 +175,7 @@ xray-xhttp-warp/
 │   ├── install_cert.sh                # 集成官方 acme.sh 证书申请、安装与自动续期脚本
 │   ├── install_tunnel.sh              # 容器/NAT穿透模式自动化安装脚本
 │   ├── install_warp.sh                # Cloudflare 官方 WARP SOCKS5 自动化安装脚本
-│   ├── install_xray.sh                # Xray 原生双节点 + ForceIPv6 分流主装机脚本
+│   ├── install_xray.sh                # Xray 原生双节点 + WARP IPv6/IPv4 双出口分流主装机脚本
 │   ├── warp_ctl.sh                    # warp 命令兼容入口包装脚本（转发至 xm warp）
 │   └── xm_ctl.sh                      # /usr/local/bin/xm 统一管理工具（单文件自包含，集成 warp）
 ├── systemd/
