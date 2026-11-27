@@ -1182,7 +1182,143 @@ route_normalize_target() {
         v4|ipv4|warp-v4|warp4|warp-ipv4|warp-ipv4-out) echo "warp-ipv4-out" ;;
         v6|ipv6|warp-v6|warp6|warp-ipv6|warp-ipv6-out) echo "warp-ipv6-out" ;;
         direct|vps) echo "direct" ;;
+        block|blackhole|drop|reject) echo "block" ;;
         *) return 1 ;;
+    esac
+}
+
+route_is_valid_ipv4_cidr() {
+    local s="$1" ip="${1%%/*}" cidr="" o
+    if [[ "$s" == */* ]]; then
+        cidr="${s#*/}"
+        [[ "$cidr" =~ ^[0-9]+$ ]] && [ "$cidr" -ge 0 ] && [ "$cidr" -le 32 ] || return 1
+    fi
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    local IFS='.'
+    for o in $ip; do
+        [ "$o" -ge 0 ] && [ "$o" -le 255 ] || return 1
+    done
+    return 0
+}
+
+route_is_valid_ipv6_cidr() {
+    local s="$1" addr="${1%%/*}" cidr=""
+    if [[ "$s" == */* ]]; then
+        cidr="${s#*/}"
+        [[ "$cidr" =~ ^[0-9]+$ ]] && [ "$cidr" -ge 0 ] && [ "$cidr" -le 128 ] || return 1
+    fi
+    [[ "$addr" == *:* ]] || return 1
+    [[ "$addr" =~ ^[0-9a-fA-F:]+$ ]] || return 1
+    [[ "$addr" != *:::* ]] || return 1
+    # 至少有两段或包含 :: 缩写，避免把 bare "::" 之外的单冒号误判
+    [ "${#addr}" -ge 2 ] || return 1
+    return 0
+}
+
+route_is_valid_ports() {
+    local spec="$1" seg a b
+    [ -n "$spec" ] || return 1
+    local IFS=','
+    for seg in $spec; do
+        if [[ "$seg" =~ ^([0-9]{1,5})-([0-9]{1,5})$ ]]; then
+            a="${BASH_REMATCH[1]}"
+            b="${BASH_REMATCH[2]}"
+            [ "$a" -ge 1 ] && [ "$a" -le 65535 ] && [ "$b" -ge 1 ] && [ "$b" -le 65535 ] && [ "$a" -le "$b" ] || return 1
+        elif [[ "$seg" =~ ^[0-9]{1,5}$ ]]; then
+            [ "$seg" -ge 1 ] && [ "$seg" -le 65535 ] || return 1
+        else
+            return 1
+        fi
+    done
+    return 0
+}
+
+route_classify_token() {
+    local raw norm lowered val
+    raw=$(echo "${1:-}" | tr -d ' \t\r\n')
+    [ -z "$raw" ] && return 1
+    lowered=$(echo "$raw" | tr '[:upper:]' '[:lower:]')
+
+    case "$lowered" in
+        domain:*|full:*|geosite:*|keyword:*|regexp:*)
+            norm=$(route_normalize_domain "$raw") || return 1
+            echo "domain|${norm}"
+            return 0
+            ;;
+        geoip:*)
+            val="${lowered#geoip:}"
+            [[ "$val" =~ ^[a-z0-9][a-z0-9-]*$ ]] || return 1
+            echo "ip|geoip:${val}"
+            return 0
+            ;;
+        ip:*)
+            val="${raw#*:}"
+            lowered=$(echo "$val" | tr '[:upper:]' '[:lower:]')
+            if [[ "$lowered" =~ ^geoip:[a-z0-9][a-z0-9-]*$ ]] || route_is_valid_ipv4_cidr "$val" || route_is_valid_ipv6_cidr "$lowered"; then
+                echo "ip|${lowered}"
+                return 0
+            fi
+            return 1
+            ;;
+        src:*|source:*)
+            val="${raw#*:}"
+            lowered=$(echo "$val" | tr '[:upper:]' '[:lower:]')
+            if [[ "$lowered" =~ ^geoip:[a-z0-9][a-z0-9-]*$ ]] || route_is_valid_ipv4_cidr "$val" || route_is_valid_ipv6_cidr "$lowered"; then
+                echo "source|${lowered}"
+                return 0
+            fi
+            return 1
+            ;;
+        port:*)
+            val="${lowered#port:}"
+            route_is_valid_ports "$val" || return 1
+            echo "port|${val}"
+            return 0
+            ;;
+        srcport:*|sourceport:*)
+            val="${lowered#*:}"
+            route_is_valid_ports "$val" || return 1
+            echo "sourcePort|${val}"
+            return 0
+            ;;
+        net:*|network:*)
+            val="${lowered#*:}"
+            case "$val" in
+                tcp|udp|tcp,udp) echo "network|${val}"; return 0 ;;
+                udp,tcp) echo "network|tcp,udp"; return 0 ;;
+                *) return 1 ;;
+            esac
+            ;;
+        proto:*|protocol:*)
+            val="${lowered#*:}"
+            [ -n "$val" ] || return 1
+            local p IFS=','
+            for p in $val; do
+                case "$p" in
+                    http|tls|bittorrent|quic) ;;
+                    *) return 1 ;;
+                esac
+            done
+            echo "protocol|${val}"
+            return 0
+            ;;
+        in:*|inbound:*|inboundtag:*)
+            val="${raw#*:}"
+            [[ "$val" =~ ^[a-zA-Z0-9._,-]+$ ]] || return 1
+            echo "inboundTag|${val}"
+            return 0
+            ;;
+        *)
+            if route_is_valid_ipv4_cidr "$raw" || route_is_valid_ipv6_cidr "$lowered"; then
+                echo "ip|${lowered}"
+                return 0
+            fi
+            if norm=$(route_normalize_domain "$raw"); then
+                echo "domain|${norm}"
+                return 0
+            fi
+            return 1
+            ;;
     esac
 }
 
@@ -1331,10 +1467,197 @@ route_list() {
         echo -e "${RED}❌ 当前系统缺少 jq，无法解析路由列表！${PLAIN}"
         return 1
     fi
+    local strategy
+    strategy=$(jq -r '.routing.domainStrategy // "AsIs"' "$CONFIG" 2>/dev/null)
     echo -e "${CYAN}=== 当前出站 (Outbounds) ===${PLAIN}"
     jq -r '.outbounds[]? | "  - \(.tag) (\(.protocol)\(if .streamSettings.sockopt.domainStrategy? then ", \(.streamSettings.sockopt.domainStrategy)" else "" end)\(if .streamSettings.sockopt.dialerProxy? then " -> \(.streamSettings.sockopt.dialerProxy)" else "" end))"' "$CONFIG"
-    echo -e "${CYAN}=== 当前分流规则 (Routing Rules) ===${PLAIN}"
-    jq -r '(.routing.rules // []) | to_entries[] | "  [\(.key + 1)] -> \(.value.outboundTag): \(if .value.domain? then (.value.domain | join(", ")) elif .value.ip? then ("ip=" + (.value.ip | join(", "))) elif .value.network? then ("network=" + .value.network + " (默认兜底)") else "all" end)"' "$CONFIG"
+    echo -e "${CYAN}=== 当前分流规则 (domainStrategy: ${YELLOW}${strategy}${CYAN}) ===${PLAIN}"
+    jq -r '(.routing.rules // []) | to_entries[] |
+      [
+        (if .value.domain? then "domain=[" + (.value.domain | join(", ")) + "]" else empty end),
+        (if .value.ip? then "ip=[" + (.value.ip | join(", ")) + "]" else empty end),
+        (if .value.source? then "source=[" + (.value.source | join(", ")) + "]" else empty end),
+        (if .value.protocol? then "protocol=[" + (.value.protocol | join(", ")) + "]" else empty end),
+        (if .value.inboundTag? then "inbound=[" + (.value.inboundTag | join(", ")) + "]" else empty end),
+        (if .value.port? then "port=" + (.value.port | tostring) else empty end),
+        (if .value.sourcePort? then "sourcePort=" + (.value.sourcePort | tostring) else empty end),
+        (if .value.network? then "network=" + .value.network else empty end)
+      ] as $parts
+      | "  [\(.key + 1)] -> \(.value.outboundTag): \(if ($parts | length) > 0 then ($parts | join(" & ")) else "all" end)\(if (.value.outboundTag=="direct" and (.value.network? == "tcp,udp") and ($parts | length) == 1) then " (默认兜底)" elif (.value.outboundTag=="block" and (.value.ip? == ["geoip:private"]) and ($parts | length) == 1) then " (默认保护)" else "" end)"' "$CONFIG"
+}
+
+route_tokenize_args() {
+    local arg part lowered
+    for arg in "$@"; do
+        lowered=$(echo "$arg" | tr '[:upper:]' '[:lower:]')
+        case "$lowered" in
+            port:*|srcport:*|sourceport:*|net:*|network:*|proto:*|protocol:*|in:*|inbound:*|inboundtag:*|regexp:*)
+                echo "$arg"
+                ;;
+            *)
+                local IFS=','
+                for part in $arg; do
+                    [ -n "$part" ] && echo "$part"
+                done
+                ;;
+        esac
+    done
+}
+
+route_build_spec_json() {
+    local -a tokens=("$@")
+    local tok res field val bad=()
+    local -a arr_domain=() arr_ip=() arr_source=() arr_protocol=() arr_inbound=()
+    local s_port="" s_srcport="" s_network="" p IFS_bak="$IFS"
+
+    for tok in "${tokens[@]}"; do
+        [ -z "$tok" ] && continue
+        if ! res=$(route_classify_token "$tok"); then
+            bad+=("$tok")
+            continue
+        fi
+        field="${res%%|*}"
+        val="${res#*|}"
+        case "$field" in
+            domain) arr_domain+=("$val") ;;
+            ip) arr_ip+=("$val") ;;
+            source) arr_source+=("$val") ;;
+            protocol)
+                IFS=','
+                for p in $val; do [ -n "$p" ] && arr_protocol+=("$p"); done
+                IFS="$IFS_bak"
+                ;;
+            inboundTag)
+                IFS=','
+                for p in $val; do [ -n "$p" ] && arr_inbound+=("$p"); done
+                IFS="$IFS_bak"
+                ;;
+            port) s_port="${s_port:+${s_port},}${val}" ;;
+            sourcePort) s_srcport="${s_srcport:+${s_srcport},}${val}" ;;
+            network)
+                if [ -z "$s_network" ] || [ "$s_network" = "$val" ]; then
+                    s_network="$val"
+                else
+                    s_network="tcp,udp"
+                fi
+                ;;
+        esac
+    done
+
+    if [ ${#bad[@]} -gt 0 ]; then
+        echo -e "${RED}❌ 无法识别的规则条件: ${bad[*]}${PLAIN}" >&2
+        echo -e "${YELLOW}💡 支持格式: 域名(paytr.com) / full: / keyword: / regexp: / geosite: / IP或CIDR / geoip:cn / port:80,443 / srcport: / proto:bittorrent / net:udp / in:入站tag / src:来源IP${PLAIN}" >&2
+        return 1
+    fi
+
+    local spec="{}"
+    local arr_json
+    if [ ${#arr_domain[@]} -gt 0 ]; then
+        arr_json=$(printf '%s\n' "${arr_domain[@]}" | jq -R . | jq -s 'reduce .[] as $x ([]; if index($x) then . else . + [$x] end)')
+        spec=$(jq -cn --argjson s "$spec" --argjson v "$arr_json" '$s + {domain:$v}')
+    fi
+    if [ ${#arr_ip[@]} -gt 0 ]; then
+        arr_json=$(printf '%s\n' "${arr_ip[@]}" | jq -R . | jq -s 'reduce .[] as $x ([]; if index($x) then . else . + [$x] end)')
+        spec=$(jq -cn --argjson s "$spec" --argjson v "$arr_json" '$s + {ip:$v}')
+    fi
+    if [ ${#arr_source[@]} -gt 0 ]; then
+        arr_json=$(printf '%s\n' "${arr_source[@]}" | jq -R . | jq -s 'reduce .[] as $x ([]; if index($x) then . else . + [$x] end)')
+        spec=$(jq -cn --argjson s "$spec" --argjson v "$arr_json" '$s + {source:$v}')
+    fi
+    if [ ${#arr_protocol[@]} -gt 0 ]; then
+        arr_json=$(printf '%s\n' "${arr_protocol[@]}" | jq -R . | jq -s 'reduce .[] as $x ([]; if index($x) then . else . + [$x] end)')
+        spec=$(jq -cn --argjson s "$spec" --argjson v "$arr_json" '$s + {protocol:$v}')
+    fi
+    if [ ${#arr_inbound[@]} -gt 0 ]; then
+        arr_json=$(printf '%s\n' "${arr_inbound[@]}" | jq -R . | jq -s 'reduce .[] as $x ([]; if index($x) then . else . + [$x] end)')
+        spec=$(jq -cn --argjson s "$spec" --argjson v "$arr_json" '$s + {inboundTag:$v}')
+    fi
+    [ -n "$s_port" ] && spec=$(jq -cn --argjson s "$spec" --arg v "$s_port" '$s + {port:$v}')
+    [ -n "$s_srcport" ] && spec=$(jq -cn --argjson s "$spec" --arg v "$s_srcport" '$s + {sourcePort:$v}')
+    [ -n "$s_network" ] && spec=$(jq -cn --argjson s "$spec" --arg v "$s_network" '$s + {network:$v}')
+
+    [ "$spec" = "{}" ] && return 1
+    printf '%s\n' "$spec"
+}
+
+route_maybe_prompt_ip_strategy() {
+    local interactive="${1:-0}" spec_json="$2"
+    ROUTE_NEW_STRATEGY=""
+    [ -f "$CONFIG" ] || return 0
+    echo "$spec_json" | jq -e '(.ip | length // 0) > 0' >/dev/null 2>&1 || return 0
+    local cur_strategy
+    cur_strategy=$(jq -r '.routing.domainStrategy // "AsIs"' "$CONFIG" 2>/dev/null || echo "AsIs")
+    [ "$cur_strategy" != "AsIs" ] && return 0
+
+    if [ "$interactive" -eq 1 ]; then
+        local ans=""
+        echo -e "${YELLOW}💡 提示: 当前 routing.domainStrategy 为 AsIs（访问域名时不会先 DNS 解析再去匹配 IP/GeoIP 规则）。${PLAIN}"
+        read_tty -p "是否一并将解析策略切换为 IPIfNonMatch (推荐)？[Y/n]: " ans || ans="n"
+        if [[ -z "$ans" || "$ans" == "y" || "$ans" == "Y" ]]; then
+            ROUTE_NEW_STRATEGY="IPIfNonMatch"
+        fi
+    else
+        echo -e "${YELLOW}💡 提示: 当前 domainStrategy 为 AsIs；如需让域名也经 DNS 解析命中 IP/GeoIP 规则，可执行: xm route strategy IPIfNonMatch${PLAIN}"
+    fi
+}
+
+route_set_strategy() {
+    [ -f "$CONFIG" ] || { echo -e "${RED}❌ 未找到配置文件 $CONFIG${PLAIN}"; return 1; }
+    local val="${1:-}" lowered="" target=""
+    if [ -z "$val" ]; then
+        local cur
+        cur=$(jq -r '.routing.domainStrategy // "AsIs"' "$CONFIG" 2>/dev/null || echo "AsIs")
+        echo -e "${CYAN}当前域名解析策略: ${YELLOW}${cur}${PLAIN}"
+        echo -e "  ${GREEN}1.${PLAIN} AsIs         (默认：仅直接匹配域名，不对域名执行额外 DNS 解析)"
+        echo -e "  ${GREEN}2.${PLAIN} IPIfNonMatch (推荐用于 GeoIP：域名未命中时解析 IP 再匹配 IP 规则)"
+        echo -e "  ${GREEN}3.${PLAIN} IPOnDemand   (优先解析域名 IP 后进入路由规则匹配)"
+        echo -e "  ${GREEN}0.${PLAIN} 取消返回"
+        local c=""
+        read_tty -p "请选择策略 [0-3]: " c || return 0
+        c=$(echo "$c" | tr -d ' \t\r\n')
+        case "$c" in
+            1) target="AsIs" ;;
+            2) target="IPIfNonMatch" ;;
+            3) target="IPOnDemand" ;;
+            0|""|q|Q) echo -e "${YELLOW}已取消，未做任何修改。${PLAIN}"; return 0 ;;
+            *) echo -e "${RED}❌ 无效选项！${PLAIN}"; return 1 ;;
+        esac
+    else
+        lowered=$(echo "$val" | tr -d ' \t\r\n' | tr '[:upper:]' '[:lower:]')
+        case "$lowered" in
+            asis) target="AsIs" ;;
+            ipifnonmatch) target="IPIfNonMatch" ;;
+            ipondemand) target="IPOnDemand" ;;
+            *) echo -e "${RED}❌ 不支持的策略: ${val} (可选: AsIs, IPIfNonMatch, IPOnDemand)${PLAIN}"; return 1 ;;
+        esac
+    fi
+
+    local cur
+    cur=$(jq -r '.routing.domainStrategy // "AsIs"' "$CONFIG" 2>/dev/null || echo "AsIs")
+    if [ "$cur" = "$target" ]; then
+        echo -e "${YELLOW}ℹ️ 当前解析策略已是 ${target}，无需修改。${PLAIN}"
+        return 0
+    fi
+    if route_apply_jq '.routing.domainStrategy = $st' --arg st "$target"; then
+        echo -e "${GREEN}✅ routing.domainStrategy 已切换为 ${target} 并重载 Xray！${PLAIN}"
+    fi
+}
+
+route_prompt_target() {
+    local target_raw=""
+    read_tty -p "选择目标出口 [v4=WARP IPv4 / v6=WARP IPv6 / direct=VPS直连 / block=屏蔽拦截，0/q 返回] (默认 v4): " target_raw || return 1
+    target_raw=$(echo "$target_raw" | tr -d ' \t\r\n')
+    case "$target_raw" in
+        0|q|Q|quit|exit)
+            echo -e "${YELLOW}已取消，返回路由菜单。${PLAIN}" >&2
+            return 1
+            ;;
+        "") target_raw="v4" ;;
+    esac
+    route_normalize_target "$target_raw" || {
+        echo -e "${RED}❌ 不支持的出口标识: ${target_raw} (可选: v4, v6, direct, block)${PLAIN}" >&2
+        return 1
+    }
 }
 
 route_add() {
@@ -1342,34 +1665,25 @@ route_add() {
     [ $# -gt 0 ] && shift
     local target
     if [ -z "$target_raw" ]; then
-        read_tty -p "选择目标出口 [v4=WARP IPv4 / v6=WARP IPv6 / direct=VPS直连，0/q 返回] (默认 v4): " target_raw || return 0
-        target_raw=$(echo "$target_raw" | tr -d ' \t\r\n')
-        case "$target_raw" in
-            0|q|Q|quit|exit)
-                echo -e "${YELLOW}已取消，返回路由菜单。${PLAIN}"
-                return 0
-                ;;
-            "") target_raw="v4" ;;
-        esac
+        target=$(route_prompt_target) || return 0
+    else
+        target=$(route_normalize_target "$target_raw") || {
+            echo -e "${RED}❌ 不支持的出口标识: ${target_raw} (可选: v4, v6, direct, block)${PLAIN}"
+            return 1
+        }
     fi
-    target=$(route_normalize_target "$target_raw") || {
-        echo -e "${RED}❌ 不支持的出口标识: ${target_raw} (可选: v4, v6, direct)${PLAIN}"
-        return 1
-    }
 
-    local cli_mode=0 raw_inputs=()
+    local cli_mode=0 raw_inputs=() tokens=() spec_json=""
     if [ $# -gt 0 ]; then
         cli_mode=1
         raw_inputs=("$@")
     fi
 
-    local norm_domains=() bad_inputs=() item part norm
     while true; do
-        norm_domains=()
-        bad_inputs=()
+        tokens=()
         if [ "$cli_mode" -eq 0 ]; then
             local line=""
-            read_tty -p "请输入域名 (空格/逗号分隔, 如 paytr.com oyunfor.com; 回车或 0/q 取消): " line || return 0
+            read_tty -p "请输入规则 (空格/逗号分隔, 如 paytr.com 1.2.3.4 geoip:cn port:443 proto:bittorrent; 回车或 0/q 取消): " line || return 0
             line=$(echo "$line" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
             case "$line" in
                 ""|0|q|Q|quit|exit)
@@ -1377,85 +1691,187 @@ route_add() {
                     return 0
                     ;;
             esac
-            line="${line//,/ }"
             read -r -a raw_inputs <<< "$line"
         fi
 
-        for item in "${raw_inputs[@]}"; do
-            for part in ${item//,/ }; do
-                [ -z "$part" ] && continue
-                if norm=$(route_normalize_domain "$part"); then
-                    norm_domains+=("$norm")
-                else
-                    bad_inputs+=("$part")
-                fi
-            done
-        done
+        while IFS= read -r t; do
+            [ -n "$t" ] && tokens+=("$t")
+        done < <(route_tokenize_args "${raw_inputs[@]}")
 
-        if [ ${#bad_inputs[@]} -gt 0 ]; then
-            echo -e "${RED}❌ 无效域名或规则格式: ${bad_inputs[*]}（示例: paytr.com 或 geosite:netflix）${PLAIN}"
-            if [ "$cli_mode" -eq 1 ]; then
-                return 1
-            fi
+        if [ ${#tokens[@]} -eq 0 ]; then
+            [ "$cli_mode" -eq 1 ] && { echo -e "${RED}❌ 未提供有效的规则条件！${PLAIN}"; return 1; }
             continue
         fi
-        if [ ${#norm_domains[@]} -eq 0 ]; then
-            if [ "$cli_mode" -eq 1 ]; then
-                echo -e "${RED}❌ 未提供有效的域名规则！${PLAIN}"
-                return 1
-            fi
-            continue
+
+        if spec_json=$(route_build_spec_json "${tokens[@]}"); then
+            break
         fi
-        break
+        [ "$cli_mode" -eq 1 ] && return 1
     done
 
-    local items_json
-    items_json=$(printf '%s\n' "${norm_domains[@]}" | jq -R . | jq -s 'reduce .[] as $x ([]; if index($x) then . else . + [$x] end)')
-
-    if [ -f "$CONFIG" ] && command -v jq >/dev/null 2>&1; then
-        local outbound_ready=1
-        if [ "$target" = "warp-ipv4-out" ] || [ "$target" = "warp-ipv6-out" ]; then
-            jq -e --arg tag "$target" '.outbounds[]? | select(.tag == $tag and .protocol == "freedom")' "$CONFIG" >/dev/null 2>&1 || outbound_ready=0
-        fi
-        if [ "$outbound_ready" -eq 1 ] && jq -e --arg tag "$target" --argjson items "$items_json" '
-            [.routing.rules[]? | select(.outboundTag == $tag and (.domain | type == "array")) | .domain[]] as $cur
-            | ($items | all(. as $d | ($cur | index($d)) != null))
-        ' "$CONFIG" >/dev/null 2>&1; then
-            echo -e "${YELLOW}ℹ️ 以下规则已在 [${target}] 中，无需重复添加: ${norm_domains[*]}${PLAIN}"
-            return 0
-        fi
+    local outbound_ready=1
+    if [ "$target" = "warp-ipv4-out" ] || [ "$target" = "warp-ipv6-out" ]; then
+        jq -e --arg tag "$target" '.outbounds[]? | select(.tag == $tag and .protocol == "freedom")' "$CONFIG" >/dev/null 2>&1 || outbound_ready=0
     fi
+
+    ROUTE_NEW_STRATEGY=""
+    route_maybe_prompt_ip_strategy "$((1 - cli_mode))" "$spec_json"
+
+    if [ "$outbound_ready" -eq 1 ] && [ -z "$ROUTE_NEW_STRATEGY" ] && jq -e --arg tag "$target" --argjson spec "$spec_json" '
+        . as $root
+        | ($spec | to_entries) | all(. as $e |
+          if ($e.value | type == "array") then
+            ([($root.routing.rules // [])[] | select(.outboundTag == $tag and (.[$e.key] | type == "array") and (([keys[] | select(. != "type" and . != "outboundTag" and . != "balancerTag" and . != "ruleTag")] | length) == 1)) | .[$e.key][]] as $cur | ($e.value | all(. as $v | ($cur | index($v)) != null)))
+          else
+            any(($root.routing.rules // [])[]; .outboundTag == $tag and (.[$e.key] == $e.value) and (([keys[] | select(. != "type" and . != "outboundTag" and . != "balancerTag" and . != "ruleTag")] | length) == 1))
+          end
+        )
+    ' "$CONFIG" >/dev/null 2>&1; then
+        echo -e "${YELLOW}ℹ️ 以下规则已在 [${target}] 中，无需重复添加。${PLAIN}"
+        return 0
+    fi
+
     local jq_prog
-    jq_prog="$(route_jq_prelude)
-    (if (\$tag == \"warp-ipv4-out\" or \$tag == \"warp-ipv6-out\") then ensure_warp_ipv4 else . end)
+    jq_prog=$(
+        route_jq_prelude
+        cat << 'JQ'
+    def insert_idx($t; $key):
+      if $t == "block" or ($t == "direct" and ($key == "domain" or $key == "inboundTag")) then
+        ([to_entries[] | select(.value.outboundTag != "block") | .key] | .[0])
+      else
+        ([to_entries[] | select(.value.outboundTag == "direct" and (.value.domain == null) and (.value.ip == null) and (.value.port == null) and (.value.sourcePort == null) and (.value.protocol == null) and (.value.inboundTag == null) and (.value.source == null)) | .key] | .[0])
+      end;
+    (if ($tag == "warp-ipv4-out" or $tag == "warp-ipv6-out") then ensure_warp_ipv4 else . end)
+    | (if $new_strategy != "" then .routing.domainStrategy = $new_strategy else . end)
+    | .routing.rules |= (
+        reduce ($spec | to_entries[]) as $item (. // [];
+          ($item.key) as $k
+          | ($item.value) as $v
+          | if ($v | type == "array") then
+              map(
+                if .outboundTag != $tag and (.[$k] | type == "array") and (([keys[] | select(. != "type" and . != "outboundTag" and . != "balancerTag" and . != "ruleTag")] | length) == 1) then
+                  .[$k] |= (. - $v)
+                else . end
+              )
+              | map(select((.[$k] | type != "array") or (.[$k] | length > 0)))
+              | ([to_entries[] | select(.value.outboundTag == $tag and (.value[$k] | type == "array") and (([.value | keys[] | select(. != "type" and . != "outboundTag" and . != "balancerTag" and . != "ruleTag")] | length) == 1)) | .key] | .[0]) as $idx
+              | if $idx != null then
+                  .[$idx][$k] = ((.[$idx][$k] + $v) | uniq_keep)
+                else
+                  ({ "type": "field", "outboundTag": $tag, ($k): ($v | uniq_keep) }) as $new_rule
+                  | insert_idx($tag; $k) as $ins
+                  | if $ins != null then .[:$ins] + [$new_rule] + .[$ins:] else . + [$new_rule] end
+                end
+            else
+              if any(.[]; .outboundTag == $tag and (.[$k] == $v) and (([keys[] | select(. != "type" and . != "outboundTag" and . != "balancerTag" and . != "ruleTag")] | length) == 1)) then
+                .
+              else
+                ({ "type": "field", "outboundTag": $tag, ($k): $v }) as $new_rule
+                | insert_idx($tag; $k) as $ins
+                | if $ins != null then .[:$ins] + [$new_rule] + .[$ins:] else . + [$new_rule] end
+              end
+            end
+        )
+      )
+JQ
+)
+
+    if route_apply_jq "$jq_prog" --arg tag "$target" --argjson spec "$spec_json" --arg new_strategy "$ROUTE_NEW_STRATEGY"; then
+        echo -e "${GREEN}✅ 已将规则加入 [${target}] (${spec_json}) 并重载 Xray！${PLAIN}"
+    fi
+}
+
+route_combo() {
+    local target_raw="${1:-}"
+    [ $# -gt 0 ] && shift
+    local target
+    if [ -z "$target_raw" ]; then
+        target=$(route_prompt_target) || return 0
+    else
+        target=$(route_normalize_target "$target_raw") || {
+            echo -e "${RED}❌ 不支持的出口标识: ${target_raw} (可选: v4, v6, direct, block)${PLAIN}"
+            return 1
+        }
+    fi
+
+    local cli_mode=0 raw_inputs=() tokens=() spec_json=""
+    if [ $# -gt 0 ]; then
+        cli_mode=1
+        raw_inputs=("$@")
+    fi
+
+    while true; do
+        tokens=()
+        if [ "$cli_mode" -eq 0 ]; then
+            local line=""
+            echo -e "${CYAN}💡 组合规则将同一条规则内的所有条件设为【同时满足 (AND)】${PLAIN}"
+            echo -e "${CYAN}   示例: net:udp port:443 (屏蔽QUIC) | in:xhttp-h3-in geoip:cn (指定入站+GeoIP)${PLAIN}"
+            read_tty -p "请输入组合条件 (空格分隔; 回车或 0/q 取消): " line || return 0
+            line=$(echo "$line" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+            case "$line" in
+                ""|0|q|Q|quit|exit)
+                    echo -e "${YELLOW}已取消，未做任何修改。${PLAIN}"
+                    return 0
+                    ;;
+            esac
+            read -r -a raw_inputs <<< "$line"
+        fi
+
+        while IFS= read -r t; do
+            [ -n "$t" ] && tokens+=("$t")
+        done < <(route_tokenize_args "${raw_inputs[@]}")
+
+        if [ ${#tokens[@]} -eq 0 ]; then
+            [ "$cli_mode" -eq 1 ] && { echo -e "${RED}❌ 未提供有效组合条件！${PLAIN}"; return 1; }
+            continue
+        fi
+
+        if spec_json=$(route_build_spec_json "${tokens[@]}"); then
+            break
+        fi
+        [ "$cli_mode" -eq 1 ] && return 1
+    done
+
+    local outbound_ready=1
+    if [ "$target" = "warp-ipv4-out" ] || [ "$target" = "warp-ipv6-out" ]; then
+        jq -e --arg tag "$target" '.outbounds[]? | select(.tag == $tag and .protocol == "freedom")' "$CONFIG" >/dev/null 2>&1 || outbound_ready=0
+    fi
+
+    ROUTE_NEW_STRATEGY=""
+    route_maybe_prompt_ip_strategy "$((1 - cli_mode))" "$spec_json"
+
+    local new_rule_json
+    new_rule_json=$(jq -cn --arg tag "$target" --argjson spec "$spec_json" '{"type":"field","outboundTag":$tag} + $spec')
+    if [ "$outbound_ready" -eq 1 ] && [ -z "$ROUTE_NEW_STRATEGY" ] && jq -e --argjson nr "$new_rule_json" 'any(.routing.rules[]?; . == $nr)' "$CONFIG" >/dev/null 2>&1; then
+        echo -e "${YELLOW}ℹ️ 该组合规则已存在，无需重复添加。${PLAIN}"
+        return 0
+    fi
+
+    local has_domain_or_in=0
+    echo "$spec_json" | jq -e '.domain? != null or .inboundTag? != null' >/dev/null 2>&1 && has_domain_or_in=1
+
+    local jq_prog
+    jq_prog=$(
+        route_jq_prelude
+        cat << 'JQ'
+    (if ($tag == "warp-ipv4-out" or $tag == "warp-ipv6-out") then ensure_warp_ipv4 else . end)
+    | (if $new_strategy != "" then .routing.domainStrategy = $new_strategy else . end)
     | .routing.rules |= (
         (. // [])
-        | map(
-            if .outboundTag != \$tag and (.domain | type == \"array\") then
-              .domain |= (. - \$items)
-            else . end
-          )
-        | map(select((.domain | type != \"array\") or (.domain | length > 0)))
-        | ([to_entries[] | select(.value.outboundTag == \$tag and (.value.domain | type == \"array\")) | .key] | .[0]) as \$idx
-        | if \$idx != null then
-            .[\$idx].domain = ((.[\$idx].domain + \$items) | uniq_keep)
-          else
-            ({ \"type\": \"field\", \"outboundTag\": \$tag, \"domain\": (\$items | uniq_keep) }) as \$new_rule
-            | (if \$tag == \"direct\" then
-                 ([to_entries[] | select(.value.outboundTag != \"block\") | .key] | .[0])
-               else
-                 ([to_entries[] | select(.value.outboundTag == \"direct\" and (.value.domain == null) and (.value.ip == null)) | .key] | .[0])
-               end) as \$ins
-            | if \$ins != null then
-                .[:\$ins] + [\$new_rule] + .[\$ins:]
-              else
-                . + [\$new_rule]
-              end
+        | if any(.[]; . == $nr) then . else
+            (if ($tag == "block" or ($tag == "direct" and $prio == "1")) then
+               ([to_entries[] | select(.value.outboundTag != "block") | .key] | .[0])
+             else
+               ([to_entries[] | select(.value.outboundTag == "direct" and (.value.domain == null) and (.value.ip == null) and (.value.port == null) and (.value.sourcePort == null) and (.value.protocol == null) and (.value.inboundTag == null) and (.value.source == null)) | .key] | .[0])
+             end) as $ins
+            | if $ins != null then .[:$ins] + [$nr] + .[$ins:] else . + [$nr] end
           end
-      )"
+      )
+JQ
+)
 
-    if route_apply_jq "$jq_prog" --arg tag "$target" --argjson items "$items_json"; then
-        echo -e "${GREEN}✅ 已将以下规则加入 [${target}]: ${norm_domains[*]}${PLAIN}"
+    if route_apply_jq "$jq_prog" --arg tag "$target" --argjson nr "$new_rule_json" --arg new_strategy "$ROUTE_NEW_STRATEGY" --arg prio "$has_domain_or_in"; then
+        echo -e "${GREEN}✅ 已添加组合规则 -> [${target}] (${spec_json}) 并重载 Xray！${PLAIN}"
     fi
 }
 
@@ -1473,63 +1889,95 @@ route_del() {
         if target=$(route_normalize_target "$target_raw" 2>/dev/null); then
             :
         else
-            # 若第一个参数直接就是域名，则允许从所有规则中删除
             set -- "$target_raw" "$@"
             target=""
         fi
     fi
 
-    local del_pairs_json="[]"
+    local item_specs="[]" rule_objs="[]" rule_indices="[]"
     if [ $# -gt 0 ]; then
-        local item part stripped lowered norm specs=()
-        for item in "$@"; do
-            for part in ${item//,/ }; do
-                stripped=$(echo "$part" | tr -d ' \t\r\n')
-                [ -z "$stripped" ] && continue
-                lowered=$(echo "$stripped" | tr '[:upper:]' '[:lower:]')
-                specs+=("$(jq -nc --arg tag "$target" --arg dom "$stripped" '{tag:$tag, domain:$dom}')")
-                if norm=$(route_normalize_domain "$stripped" 2>/dev/null); then
-                    specs+=("$(jq -nc --arg tag "$target" --arg dom "$norm" '{tag:$tag, domain:$dom}')")
-                fi
-                case "$stripped" in
-                    domain:*|full:*) ;;
-                    *) specs+=("$(jq -nc --arg tag "$target" --arg dom "domain:${lowered}" '{tag:$tag, domain:$dom}')") ;;
+        local tokens=() tok lowered cls field val rnum
+        while IFS= read -r t; do
+            [ -n "$t" ] && tokens+=("$t")
+        done < <(route_tokenize_args "$@")
+
+        for tok in "${tokens[@]}"; do
+            lowered=$(echo "$tok" | tr '[:upper:]' '[:lower:]')
+            if [[ "$lowered" =~ ^rule:([1-9][0-9]*)$ ]]; then
+                rnum=$((BASH_REMATCH[1] - 1))
+                rule_indices=$(jq -cn --argjson a "$rule_indices" --argjson i "$rnum" '$a + [$i] | unique')
+                continue
+            fi
+            if cls=$(route_classify_token "$tok" 2>/dev/null); then
+                field="${cls%%|*}"
+                val="${cls#*|}"
+                case "$field" in
+                    protocol|inboundTag)
+                        local p IFS_bak="$IFS" IFS=','
+                        for p in $val; do
+                            [ -n "$p" ] && item_specs=$(jq -cn --argjson a "$item_specs" --arg tag "$target" --arg f "$field" --arg v "$p" '$a + [{tag:$tag, field:$f, val:$v}]')
+                        done
+                        IFS="$IFS_bak"
+                        ;;
+                    domain|ip|source)
+                        item_specs=$(jq -cn --argjson a "$item_specs" --arg tag "$target" --arg f "$field" --arg v "$val" '$a + [{tag:$tag, field:$f, val:$v}]')
+                        ;;
+                    port|sourcePort|network)
+                        item_specs=$(jq -cn --argjson a "$item_specs" --arg tag "$target" --arg f "$field" --arg v "$val" '$a + [{tag:$tag, field:$f, val:$v}]')
+                        ;;
                 esac
-            done
+            fi
+            # 兼容历史直接传入裸字符串（如 domain:0）按所有数组字段字面值匹配移除
+            item_specs=$(jq -cn --argjson a "$item_specs" --arg tag "$target" --arg v "$tok" '$a + [{tag:$tag, field:"domain", val:$v}, {tag:$tag, field:"ip", val:$v}, {tag:$tag, field:"source", val:$v}, {tag:$tag, field:"protocol", val:$v}, {tag:$tag, field:"inboundTag", val:$v}]')
         done
-        if [ ${#specs[@]} -eq 0 ]; then
-            echo -e "${RED}❌ 未提供要移除的域名！${PLAIN}"
-            return 1
-        fi
-        del_pairs_json=$(printf '%s\n' "${specs[@]}" | jq -s 'unique')
     else
-        local entries=() row idx=1 r_tag r_dom
-        while IFS=$'\t' read -r r_tag r_dom; do
-            [ -z "$r_tag" ] && continue
-            entries+=("${r_tag}"$'\t'"${r_dom}")
-        done < <(jq -r --arg tag "$target" '(.routing.rules // [])[] | select(($tag == "" or .outboundTag == $tag) and (.domain | type == "array")) | .outboundTag as $out | .domain[] | "\($out)\t\(.)"' "$CONFIG")
+        local entries=() row idx=1 obj disp
+        while IFS= read -r row; do
+            [ -n "$row" ] && entries+=("$row")
+        done < <(jq -c --arg tag "$target" '
+          (.routing.rules // []) | to_entries[] |
+          select($tag == "" or .value.outboundTag == $tag) |
+          (.value | [keys[] | select(. != "type" and . != "outboundTag" and . != "balancerTag" and . != "ruleTag")]) as $mkeys |
+          if ($mkeys | length) == 1 and (.value[$mkeys[0]] | type == "array") then
+            ($mkeys[0]) as $f |
+            .value.outboundTag as $out |
+            .value[$f][] |
+            {kind:"item", tag:$out, field:$f, val:., disp:("(\($out) | \($f)) \(.)" + (if ($out=="warp-ipv6-out" and (.=="geosite:openai" or .=="geosite:google-deepmind")) then " [默认AI]" elif ($out=="block" and .=="geoip:private") then " [默认保护]" else "" end))}
+          else
+            .value as $r |
+            [
+              (if $r.domain? then "domain=[" + ($r.domain | join(", ")) + "]" else empty end),
+              (if $r.ip? then "ip=[" + ($r.ip | join(", ")) + "]" else empty end),
+              (if $r.source? then "source=[" + ($r.source | join(", ")) + "]" else empty end),
+              (if $r.protocol? then "protocol=[" + ($r.protocol | join(", ")) + "]" else empty end),
+              (if $r.inboundTag? then "inbound=[" + ($r.inboundTag | join(", ")) + "]" else empty end),
+              (if $r.port? then "port=" + ($r.port | tostring) else empty end),
+              (if $r.sourcePort? then "sourcePort=" + ($r.sourcePort | tostring) else empty end),
+              (if $r.network? then "network=" + $r.network else empty end)
+            ] as $parts |
+            {kind:"rule", rule:$r, disp:("(\($r.outboundTag) | \(if ($mkeys | length) > 1 then "组合规则" else ($mkeys[0] // "rule") end)) \(if ($parts|length)>0 then ($parts|join(" & ")) else "all" end)" + (if ($r.outboundTag=="direct" and $r.network?=="tcp,udp" and ($mkeys|length)==1) then " [默认兜底]" else "" end))}
+          end
+        ' "$CONFIG")
 
         if [ ${#entries[@]} -eq 0 ]; then
-            echo -e "${YELLOW}ℹ️ 当前没有可移除的域名分流规则。${PLAIN}"
+            echo -e "${YELLOW}ℹ️ 当前没有可移除的分流规则。${PLAIN}"
             return 0
         fi
 
-        echo -e "${CYAN}当前可移除的域名规则列表:${PLAIN}"
+        echo -e "${CYAN}当前可移除的分流规则条目:${PLAIN}"
         idx=1
         for row in "${entries[@]}"; do
-            r_tag="${row%%$'\t'*}"
-            r_dom="${row#*$'\t'}"
-            local tag_note=""
-            [ "$r_dom" = "geosite:openai" ] || [ "$r_dom" = "geosite:google-deepmind" ] && tag_note=" ${YELLOW}[默认AI]${PLAIN}"
-            echo -e "  ${GREEN}[${idx}]${PLAIN} (${CYAN}${r_tag}${PLAIN}) ${r_dom}${tag_note}"
+            disp=$(echo "$row" | jq -r '.disp')
+            echo -e "  ${GREEN}[${idx}]${PLAIN} ${disp}"
             idx=$((idx + 1))
         done
 
-        local line="" raw_inputs=() specs=() part stripped lowered norm sel_idx sel_row invalid=0
+        local line="" raw_inputs=() tokens=() tok sel_idx sel_row invalid=0 kind
         while true; do
-            specs=()
+            item_specs="[]"
+            rule_objs="[]"
             invalid=0
-            read_tty -p "请输入要移除的序号或域名 (空格/逗号分隔; 回车或 0/q 取消): " line || return 0
+            read_tty -p "请输入要移除的序号或规则值 (空格分隔; 回车或 0/q 取消): " line || return 0
             line=$(echo "$line" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
             case "$line" in
                 ""|0|q|Q|quit|exit)
@@ -1537,57 +1985,95 @@ route_del() {
                     return 0
                     ;;
             esac
-            line="${line//,/ }"
             read -r -a raw_inputs <<< "$line"
-            for part in "${raw_inputs[@]}"; do
-                stripped=$(echo "$part" | tr -d ' \t\r\n')
-                [ -z "$stripped" ] && continue
-                if [[ "$stripped" =~ ^[1-9][0-9]*$ ]]; then
-                    sel_idx=$((stripped - 1))
+            tokens=()
+            while IFS= read -r t; do
+                [ -n "$t" ] && tokens+=("$t")
+            done < <(route_tokenize_args "${raw_inputs[@]}")
+
+            for tok in "${tokens[@]}"; do
+                if [[ "$tok" =~ ^[1-9][0-9]*$ ]]; then
+                    sel_idx=$((tok - 1))
                     if [ "$sel_idx" -ge 0 ] && [ "$sel_idx" -lt "${#entries[@]}" ]; then
                         sel_row="${entries[$sel_idx]}"
-                        r_tag="${sel_row%%$'\t'*}"
-                        r_dom="${sel_row#*$'\t'}"
-                        specs+=("$(jq -nc --arg tag "$r_tag" --arg dom "$r_dom" '{tag:$tag, domain:$dom}')")
+                        kind=$(echo "$sel_row" | jq -r '.kind')
+                        if [ "$kind" = "item" ]; then
+                            item_specs=$(jq -cn --argjson a "$item_specs" --argjson r "$sel_row" '$a + [{tag:$r.tag, field:$r.field, val:$r.val}]')
+                        else
+                            rule_objs=$(jq -cn --argjson a "$rule_objs" --argjson r "$sel_row" '$a + [$r.rule]')
+                        fi
                     else
-                        echo -e "${RED}❌ 序号超出范围: ${stripped} (可选 1-${#entries[@]})${PLAIN}"
+                        echo -e "${RED}❌ 序号超出范围: ${tok} (可选 1-${#entries[@]})${PLAIN}"
                         invalid=1
                     fi
                 else
-                    lowered=$(echo "$stripped" | tr '[:upper:]' '[:lower:]')
-                    specs+=("$(jq -nc --arg tag "$target" --arg dom "$stripped" '{tag:$tag, domain:$dom}')")
-                    if norm=$(route_normalize_domain "$stripped" 2>/dev/null); then
-                        specs+=("$(jq -nc --arg tag "$target" --arg dom "$norm" '{tag:$tag, domain:$dom}')")
+                    local cls field val
+                    if cls=$(route_classify_token "$tok" 2>/dev/null); then
+                        field="${cls%%|*}"
+                        val="${cls#*|}"
+                        case "$field" in
+                            protocol|inboundTag)
+                                local p IFS_bak="$IFS" IFS=','
+                                for p in $val; do
+                                    [ -n "$p" ] && item_specs=$(jq -cn --argjson a "$item_specs" --arg tag "$target" --arg f "$field" --arg v "$p" '$a + [{tag:$tag, field:$f, val:$v}]')
+                                done
+                                IFS="$IFS_bak"
+                                ;;
+                            *)
+                                item_specs=$(jq -cn --argjson a "$item_specs" --arg tag "$target" --arg f "$field" --arg v "$val" '$a + [{tag:$tag, field:$f, val:$v}]')
+                                ;;
+                        esac
                     fi
-                    specs+=("$(jq -nc --arg tag "$target" --arg dom "domain:${lowered}" '{tag:$tag, domain:$dom}')")
+                    item_specs=$(jq -cn --argjson a "$item_specs" --arg tag "$target" --arg v "$tok" '$a + [{tag:$tag, field:"domain", val:$v}, {tag:$tag, field:"ip", val:$v}, {tag:$tag, field:"source", val:$v}, {tag:$tag, field:"protocol", val:$v}, {tag:$tag, field:"inboundTag", val:$v}]')
                 fi
             done
             [ "$invalid" -eq 1 ] && continue
-            [ ${#specs[@]} -gt 0 ] && break
+            if [ "$item_specs" != "[]" ] || [ "$rule_objs" != "[]" ]; then
+                break
+            fi
         done
-        del_pairs_json=$(printf '%s\n' "${specs[@]}" | jq -s 'unique')
     fi
 
-    if ! jq -e --argjson specs "$del_pairs_json" '
-        [(.routing.rules // [])[] | select(.domain | type == "array") | .outboundTag as $out | .domain[] | select(. as $d | any($specs[]; (.tag == "" or .tag == $out) and .domain == $d))] | length > 0
-    ' "$CONFIG" >/dev/null 2>&1; then
+    local jq_filter='
+    .routing.rules |= (
+      (. // [])
+      | to_entries
+      | map(select(.key as $k | ($rindices | index($k)) == null))
+      | map(.value)
+      | map(select(. as $r | ($robjs | index($r)) == null))
+      | map(
+          . as $r
+          | ([keys[] | select(. != "type" and . != "outboundTag" and . != "balancerTag" and . != "ruleTag")] | length) as $mcnt
+          | if $mcnt == 1 then
+              ([keys[] | select(. != "type" and . != "outboundTag" and . != "balancerTag" and . != "ruleTag")] | .[0]) as $f
+              | .outboundTag as $out
+              | if (.[$f] | type == "array") then
+                  .[$f] |= map(select(. as $v | (any($specs[]; (.tag == "" or .tag == $out) and .field == $f and .val == $v) | not)))
+                elif any($specs[]; (.tag == "" or .tag == $out) and .field == $f and (.val == ($r[$f] | tostring))) then
+                  empty
+                else . end
+            else . end
+        )
+      | map(
+          ([keys[] | select(. != "type" and . != "outboundTag" and . != "balancerTag" and . != "ruleTag")] | length) as $mcnt
+          | if $mcnt == 1 then
+              ([keys[] | select(. != "type" and . != "outboundTag" and . != "balancerTag" and . != "ruleTag")] | .[0]) as $f
+              | select((.[$f] | type != "array") or (.[$f] | length > 0))
+            else . end
+        )
+    )'
+
+    local changed=0
+    if jq -e --argjson specs "$item_specs" --argjson robjs "$rule_objs" --argjson rindices "$rule_indices" \
+       "(.routing.rules // []) as \$orig | ($jq_filter) | (.routing.rules // []) != \$orig" "$CONFIG" >/dev/null 2>&1; then
+        changed=1
+    fi
+    if [ "$changed" -eq 0 ]; then
         echo -e "${YELLOW}⚠️ 未在当前分流规则中找到匹配项（未修改配置，无需重启）。${PLAIN}"
         return 0
     fi
 
-    local jq_prog='
-    .routing.rules |= (
-      (. // [])
-      | map(
-          if (.domain | type == "array") then
-            .outboundTag as $out
-            | .domain |= map(select(. as $d | (any($specs[]; (.tag == "" or .tag == $out) and .domain == $d) | not)))
-          else . end
-        )
-      | map(select((.domain | type != "array") or (.domain | length > 0)))
-    )'
-
-    if route_apply_jq "$jq_prog" --argjson specs "$del_pairs_json"; then
+    if route_apply_jq "$jq_filter" --argjson specs "$item_specs" --argjson robjs "$rule_objs" --argjson rindices "$rule_indices"; then
         echo -e "${GREEN}✅ 已移除匹配的分流规则并重载 Xray！${PLAIN}"
     fi
 }
@@ -1605,34 +2091,48 @@ manage_routes() {
         add)
             route_add "$@"
             ;;
+        combo|and)
+            route_combo "$@"
+            ;;
         del|rm|remove|delete)
             route_del "$@"
+            ;;
+        strategy|dns)
+            route_set_strategy "${1:-}"
             ;;
         "")
             while true; do
                 echo ""
                 route_list || true
+                local cur_st
+                cur_st=$(jq -r '.routing.domainStrategy // "AsIs"' "$CONFIG" 2>/dev/null || echo "AsIs")
                 echo ""
-                echo -e "${CYAN}分流路由管理 (Xray Outbound & Routing):${PLAIN}"
-                echo -e "  ${GREEN}1.${PLAIN} 添加域名走 WARP IPv4 出口 (${CYAN}warp-ipv4-out${PLAIN})"
-                echo -e "  ${GREEN}2.${PLAIN} 添加域名走 WARP IPv6 出口 (${CYAN}warp-ipv6-out${PLAIN})"
-                echo -e "  ${GREEN}3.${PLAIN} 添加域名走 VPS 直连出口 (${CYAN}direct${PLAIN})"
-                echo -e "  ${GREEN}4.${PLAIN} 移除分流域名规则（支持序号/域名）"
+                echo -e "${CYAN}分流路由管理 (支持 域名/URL/IP/CIDR/GeoIP/GeoSite/端口/协议/入站/组合):${PLAIN}"
+                echo -e "  ${GREEN}1.${PLAIN} 添加分流规则 -> WARP IPv4 (${CYAN}warp-ipv4-out${PLAIN})"
+                echo -e "  ${GREEN}2.${PLAIN} 添加分流规则 -> WARP IPv6 (${CYAN}warp-ipv6-out${PLAIN})"
+                echo -e "  ${GREEN}3.${PLAIN} 添加分流规则 -> VPS 直连  (${CYAN}direct${PLAIN})"
+                echo -e "  ${GREEN}4.${PLAIN} 添加屏蔽规则 -> 拦截黑洞  (${CYAN}block${PLAIN}，如广告/BT)"
+                echo -e "  ${GREEN}5.${PLAIN} 添加组合条件规则 (多条件 AND，如 net:udp port:443 屏蔽 QUIC)"
+                echo -e "  ${GREEN}6.${PLAIN} 移除分流规则（支持序号/规则内容）"
+                echo -e "  ${GREEN}7.${PLAIN} 切换域名解析策略 (当前: ${YELLOW}${cur_st}${PLAIN})"
                 if [ -f "$CONFIG" ] && command -v jq >/dev/null 2>&1 && jq -e '.outbounds[]? | select(.tag == "warp-ipv4-out")' "$CONFIG" >/dev/null 2>&1; then
-                    echo -e "  ${GREEN}5.${PLAIN} 为旧配置自动补全 warp-ipv4-out 出站 ${GREEN}[已就绪]${PLAIN}"
+                    echo -e "  ${GREEN}8.${PLAIN} 为旧配置自动补全 warp-ipv4-out 出站 ${GREEN}[已就绪]${PLAIN}"
                 else
-                    echo -e "  ${GREEN}5.${PLAIN} 为旧配置自动补全 warp-ipv4-out 出站 ${YELLOW}[待补全]${PLAIN}"
+                    echo -e "  ${GREEN}8.${PLAIN} 为旧配置自动补全 warp-ipv4-out 出站 ${YELLOW}[待补全]${PLAIN}"
                 fi
                 echo -e "  ${GREEN}0.${PLAIN} 返回主菜单"
                 local choice=""
-                read_tty -p "请选择 [0-5]: " choice || return 0
+                read_tty -p "请选择 [0-8]: " choice || return 0
                 choice=$(echo "$choice" | tr -d ' \t\r\n')
                 case "$choice" in
                     1) route_add "v4" || true ;;
                     2) route_add "v6" || true ;;
                     3) route_add "direct" || true ;;
-                    4) route_del || true ;;
-                    5) route_ensure_warp_v4 || true ;;
+                    4) route_add "block" || true ;;
+                    5) route_combo || true ;;
+                    6) route_del || true ;;
+                    7) route_set_strategy || true ;;
+                    8) route_ensure_warp_v4 || true ;;
                     0|"") return 0 ;;
                     *) echo -e "${RED}无效选项，请重新输入！${PLAIN}" ;;
                 esac
@@ -1640,10 +2140,12 @@ manage_routes() {
             ;;
         *)
             echo "用法:"
-            echo "  xm route list                         查看当前出站与分流规则"
-            echo "  xm route ensure                       为旧配置补全 warp-ipv4-out 出站"
-            echo "  xm route add <v4|v6|direct> <域名...> 添加域名分流 (如: xm route add v4 paytr.com oyunfor.com)"
-            echo "  xm route del [v4|v6|direct] <域名...> 移除域名分流 (如: xm route del paytr.com)"
+            echo "  xm route list                                     查看出站、解析策略与所有分流规则"
+            echo "  xm route ensure                                   为旧配置补全 warp-ipv4-out 出站"
+            echo "  xm route add <v4|v6|direct|block> <规则...>       添加独立条件 (如: paytr.com 1.2.3.4 geoip:cn port:443)"
+            echo "  xm route combo <v4|v6|direct|block> <条件...>     添加组合条件 AND 规则 (如: block net:udp port:443)"
+            echo "  xm route del [出口] <规则...|rule:序号>           移除分流规则 (支持 rule:2 / 域名 / IP / port:443)"
+            echo "  xm route strategy <AsIs|IPIfNonMatch|IPOnDemand>  切换 routing.domainStrategy"
             return 1
             ;;
     esac
