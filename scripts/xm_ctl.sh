@@ -1402,7 +1402,7 @@ def uniq_keep:
   reduce .[] as $x ([]; if index($x) then . else . + [$x] end);
 def sync_ip_catchall:
   if (.routing.domainStrategy == "IPIfNonMatch") and ((.outbounds[0].tag // "") == "direct") then
-    .routing.rules |= map(select(not (.outboundTag == "direct" and .network == "tcp,udp" and (([keys[] | select(. != "type" and . != "outboundTag" and . != "balancerTag" and . != "ruleTag")] | length) == 1))))
+    .routing.rules |= map(select((.outboundTag == "direct" and .network == "tcp,udp" and (([keys[] | select(. != "type" and . != "outboundTag" and . != "balancerTag" and . != "ruleTag")] | length) == 1)) | not))
   elif (.routing.domainStrategy == "AsIs") and ((.outbounds[0].tag // "") == "direct") and ([(.routing.rules // [])[] | select(.outboundTag == "direct" and .network == "tcp,udp" and (([keys[] | select(. != "type" and . != "outboundTag" and . != "balancerTag" and . != "ruleTag")] | length) == 1))] | length == 0) then
     .routing.rules += [{"type":"field","outboundTag":"direct","network":"tcp,udp"}]
   else
