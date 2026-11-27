@@ -13,7 +13,7 @@ if [ "${EUID:-$(id -u)}" -ne 0 ]; then
     if command -v sudo >/dev/null 2>&1; then
         echo ">>> 检测到当前为非 root 用户 ($(id -un))，正在通过 sudo 自动提权..."
         _ELEVATE_ENV=()
-        for _v in REPO_URL CERT_PATH KEY_PATH ENABLE_CF_TUNNEL CF_TOKEN CF_DOMAIN LOCAL_PORT; do
+        for _v in REPO_URL CERT_PATH KEY_PATH ENABLE_CF_TUNNEL CF_TOKEN CF_DOMAIN LOCAL_PORT CUSTOM_UUID; do
             if [ "${!_v+set}" = "set" ]; then
                 _ELEVATE_ENV+=("${_v}=${!_v}")
             fi

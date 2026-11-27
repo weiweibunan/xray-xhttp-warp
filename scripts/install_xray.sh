@@ -89,13 +89,15 @@ if [ "$OPT_CF_TUNNEL" = "true" ]; then
     install_cloudflared
 fi
 
+resolve_install_uuid "$XRAY_CONFIG"
+UUID="$RESOLVED_UUID"
+
 log_ok ">>> [XRAY 2/5] 下载并校验官方最新 Xray 内核..."
 install_xray_core
 
 log_ok ">>> [XRAY 3/5] 下载并校验 geosite.dat 与 geoip.dat 规则库..."
 ensure_dat
 
-UUID=$(extract_uuid_from_config "$XRAY_CONFIG")
 [ -z "$UUID" ] && UUID=$(generate_uuid)
 
 PATH_H3="/${UUID}-xu"

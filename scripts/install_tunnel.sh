@@ -38,13 +38,16 @@ echo -e "${CYAN}      无需容器开放任何公网端口，本地无需申请 
 echo -e "${CYAN}      同时集成纯用户态 WireGuard WARP 出口，强制 IPv6 解锁 OpenAI / Gemini！${PLAIN}"
 echo -e "${BLUE}--------------------------------------------------------------------${PLAIN}"
 
-# 1-3. 交互式输入 Token、域名与本地监听端口
+# 1-3. 交互式输入 Token、域名与本地监听端口，以及可选复用 UUID
 prompt_tunnel_params 8080
+resolve_install_uuid "$XRAY_CONFIG"
+UUID="$RESOLVED_UUID"
 
 echo -e "${BLUE}--------------------------------------------------------------------${PLAIN}"
 echo -e "配置确认："
 echo -e "  - 隧道域名 : ${CYAN}${CF_DOMAIN}${PLAIN}"
 echo -e "  - 本地端口 : ${CYAN}127.0.0.1:${LOCAL_PORT}${PLAIN}"
+echo -e "  - 用户 UUID: ${CYAN}${UUID}${PLAIN}"
 echo -e "  - AI 分流  : ${GREEN}OpenAI + Gemini -> Cloudflare WARP (WireGuard ForceIPv6)${PLAIN}"
 echo -e "  - 运行环境 : $(is_systemd && echo "${GREEN}标准系统 (Systemd)${PLAIN}" || echo "${YELLOW}轻量容器/沙箱 (进程自守护)${PLAIN}")"
 echo -e "${BLUE}--------------------------------------------------------------------${PLAIN}"
@@ -336,7 +339,6 @@ else
 fi
 
 log_ok ">>> [TUNNEL 5/6] 生成并校验隧道入栈 Xray 配置..."
-UUID=$(extract_uuid_from_config "$XRAY_CONFIG")
 [ -z "$UUID" ] && UUID=$(generate_uuid)
 PATH_XC="/${UUID}-xc"
 

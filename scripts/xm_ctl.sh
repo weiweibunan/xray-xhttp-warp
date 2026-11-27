@@ -527,27 +527,98 @@ set_loglevel() {
     fi
 }
 
+generate_random_uuid() {
+    if [ -r /proc/sys/kernel/random/uuid ]; then
+        cat /proc/sys/kernel/random/uuid
+    elif command -v uuidgen >/dev/null 2>&1; then
+        uuidgen | tr '[:upper:]' '[:lower:]'
+    else
+        tr -dc 'a-f0-9' < /dev/urandom | head -c 32 | sed -E 's/(.{8})(.{4})(.{4})(.{4})(.{12})/\1-\2-\3-\4-\5/'
+    fi
+}
+
+normalize_uuid_input() {
+    local val
+    val=$(echo "${1:-}" | tr -d ' \t\r\n' | tr '[:upper:]' '[:lower:]')
+    if [[ "$val" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+        echo "$val"
+        return 0
+    fi
+    return 1
+}
+
 reset_uuid() {
     if [ ! -f "$CONFIG" ]; then
         echo -e "${RED}❌ 未找到配置文件 $CONFIG！${PLAIN}"
         return 1
     fi
-    local old_uuid new_uuid
+    local old_uuid old_lower new_uuid="" input="" mode_desc="" confirm=""
     old_uuid=$(get_inbound_field "" "uuid")
     if [ -z "$old_uuid" ]; then
         echo -e "${RED}❌ 未能从 $CONFIG 解析到现有 UUID，已取消操作以防破坏配置！${PLAIN}"
         return 1
     fi
-    new_uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || tr -dc 'a-f0-9' < /dev/urandom | head -c 32 | sed -E 's/(.{8})(.{4})(.{4})(.{4})(.{12})/\1-\2-\3-\4-\5/')
+    old_lower=$(echo "$old_uuid" | tr '[:upper:]' '[:lower:]')
 
-    echo -e "当前 UUID : ${YELLOW}$old_uuid${PLAIN}"
-    echo -e "新 UUID   : ${GREEN}$new_uuid${PLAIN}"
-    read_tty -p "确认更换 UUID 并自动更新配置与路径？(y/n): " confirm
+    if [ -n "${1:-}" ]; then
+        if ! new_uuid=$(normalize_uuid_input "$1"); then
+            echo -e "${RED}❌ UUID 格式无效: ${1}${PLAIN}"
+            echo -e "${YELLOW}💡 示例: xm uuid 6cde9526-5069-4cab-8cf8-672f78a559c6${PLAIN}"
+            return 1
+        fi
+        if [ "$new_uuid" = "$old_lower" ]; then
+            echo -e "${YELLOW}ℹ️ 当前 UUID 已是 ${new_uuid}，无需更换。${PLAIN}"
+            return 0
+        fi
+        mode_desc="命令行指定"
+        confirm="y"
+        echo -e "当前 UUID : ${YELLOW}$old_uuid${PLAIN}"
+        echo -e "新 UUID   : ${GREEN}$new_uuid${PLAIN} (${mode_desc})"
+    else
+        echo -e "当前 UUID : ${YELLOW}$old_uuid${PLAIN}"
+        while true; do
+            input=""
+            if ! read_tty -p "请输入自定义 UUID [直接回车随机生成新 UUID，输入 q 取消]: " input; then
+                echo -e "${YELLOW}操作已取消。${PLAIN}"
+                return 0
+            fi
+            input=$(echo "$input" | tr -d ' \t\r\n')
+            case "$input" in
+                q|Q)
+                    echo -e "${YELLOW}操作已取消。${PLAIN}"
+                    return 0
+                    ;;
+                "")
+                    new_uuid=$(generate_random_uuid)
+                    mode_desc="随机新建"
+                    break
+                    ;;
+                *)
+                    if new_uuid=$(normalize_uuid_input "$input"); then
+                        mode_desc="自定义输入"
+                        break
+                    fi
+                    echo -e "${RED}❌ UUID 格式无效（需标准 36 位格式，如 6cde9526-5069-4cab-8cf8-672f78a559c6），请重新输入！${PLAIN}"
+                    ;;
+            esac
+        done
+        if [ "$new_uuid" = "$old_lower" ]; then
+            echo -e "${YELLOW}ℹ️ 输入的 UUID 与当前相同 (${new_uuid})，无需更换。${PLAIN}"
+            return 0
+        fi
+        echo -e "目标 UUID : ${GREEN}$new_uuid${PLAIN} (${mode_desc})"
+        read_tty -p "确认更换 UUID 并自动更新配置与路径？(y/n): " confirm || confirm="n"
+    fi
+
     if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
         local tmp_dir tmp_cfg
         tmp_dir=$(mktemp -d)
         tmp_cfg="${tmp_dir}/config.json"
-        sed "s/${old_uuid}/${new_uuid}/g" "$CONFIG" > "$tmp_cfg"
+        if [ "$old_lower" != "$old_uuid" ]; then
+            sed -e "s/${old_uuid}/${new_uuid}/g" -e "s/${old_lower}/${new_uuid}/g" "$CONFIG" > "$tmp_cfg"
+        else
+            sed "s/${old_uuid}/${new_uuid}/g" "$CONFIG" > "$tmp_cfg"
+        fi
         if ! XRAY_LOCATION_ASSET="$XRAY_ASSET_DIR" "$XRAY_BIN" run -test -c "$tmp_cfg" >/dev/null 2>&1; then
             rm -rf "$tmp_dir"
             echo -e "${RED}❌ 新配置校验失败，已回滚！${PLAIN}"
@@ -2838,7 +2909,7 @@ menu() {
         echo -e " ${GREEN}5.${PLAIN} 查看详细运行状态 (status)"
         echo -e " ${GREEN}6.${PLAIN} 查看实时日志 (log)"
         echo -e "--------------------------------------------------"
-        echo -e " ${GREEN}7.${PLAIN} 重置/更换 用户 UUID (uuid)"
+        echo -e " ${GREEN}7.${PLAIN} 更换/自定义 用户 UUID (uuid)"
         if [ "$TUNNEL_MODE" = "1" ]; then
             echo -e " ${GREEN}8.${PLAIN} 修改/更新 Cloudflare Tunnel Token (token)"
         elif [ "$CF_TUNNEL_ENABLED" = "1" ]; then
@@ -2918,7 +2989,7 @@ case "${1:-}" in
     status) status_xray ;;
     log) show_log ;;
     loglevel) set_loglevel "${2:-}" ;;
-    uuid) reset_uuid ;;
+    uuid) reset_uuid "${2:-}" ;;
     token) update_tunnel_token ;;
     tunnel) manage_native_tunnel "${2:-}" "${3:-}" ;;
     cert) manage_cert "${2:-}" ;;

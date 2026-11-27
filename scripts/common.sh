@@ -352,6 +352,59 @@ generate_uuid() {
     fi
 }
 
+normalize_uuid_input() {
+    local val
+    val=$(echo "${1:-}" | tr -d ' \t\r\n' | tr '[:upper:]' '[:lower:]')
+    if [[ "$val" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+        echo "$val"
+        return 0
+    fi
+    return 1
+}
+
+resolve_install_uuid() {
+    local cfg="${1:-$XRAY_CONFIG}"
+    local norm="" input=""
+
+    if [ -n "${CUSTOM_UUID:-}" ]; then
+        if norm=$(normalize_uuid_input "$CUSTOM_UUID"); then
+            RESOLVED_UUID="$norm"
+            log_ok "✅ 将使用指定的自定义 UUID: ${RESOLVED_UUID}"
+            return 0
+        fi
+        log_err "❌ 环境变量 CUSTOM_UUID 格式无效: ${CUSTOM_UUID}（需标准 36 位 UUID 格式）"
+        return 1
+    fi
+
+    local existing=""
+    existing=$(extract_uuid_from_config "$cfg" 2>/dev/null || true)
+    if [ -n "$existing" ]; then
+        RESOLVED_UUID="$existing"
+        log_info "ℹ️ 检测到现有配置中的 UUID，将继续复用: ${RESOLVED_UUID}"
+        return 0
+    fi
+
+    while true; do
+        input=""
+        if ! read_tty -p "请输入要复用的旧 UUID [直接回车随机生成新 UUID]: " input; then
+            RESOLVED_UUID=$(generate_uuid)
+            return 0
+        fi
+        input=$(echo "$input" | tr -d ' \t\r\n')
+        if [ -z "$input" ]; then
+            RESOLVED_UUID=$(generate_uuid)
+            log_ok "✅ 将随机生成新 UUID: ${RESOLVED_UUID}"
+            return 0
+        fi
+        if norm=$(normalize_uuid_input "$input"); then
+            RESOLVED_UUID="$norm"
+            log_ok "✅ 将使用自定义 UUID: ${RESOLVED_UUID}"
+            return 0
+        fi
+        log_err "❌ UUID 格式无效（需标准 36 位格式，如 6cde9526-5069-4cab-8cf8-672f78a559c6），请重新输入或直接回车随机生成！"
+    done
+}
+
 extract_uuid_from_config() {
     local cfg="$1"
     [ -f "$cfg" ] || return 0
