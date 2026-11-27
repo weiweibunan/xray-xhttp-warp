@@ -1187,22 +1187,41 @@ route_normalize_target() {
 }
 
 route_normalize_domain() {
-    local item
+    local item prefix host suffix
     item=$(echo "${1:-}" | tr -d ' \t\r\n')
     [ -z "$item" ] && return 1
     case "$item" in
-        domain:*|full:*|geosite:*|keyword:*|regexp:*)
+        domain:*|full:*)
+            prefix="${item%%:*}"
+            host="${item#*:}"
+            host=$(echo "$host" | tr '[:upper:]' '[:lower:]')
+            host="${host#.}"
+            if [[ "$host" =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+([a-z]{2,}|xn--[a-z0-9]{2,})$ ]]; then
+                echo "${prefix}:${host}"
+                return 0
+            fi
+            return 1
+            ;;
+        geosite:*|keyword:*|regexp:*)
+            suffix="${item#*:}"
+            [ -n "$suffix" ] || return 1
             echo "$item"
+            return 0
             ;;
         *)
             item="${item#http://}"
             item="${item#https://}"
             item="${item%%/*}"
+            item="${item%%\?*}"
+            item="${item%%#*}"
             item="${item%%:*}"
             item=$(echo "$item" | tr '[:upper:]' '[:lower:]')
             item="${item#.}"
-            [ -z "$item" ] && return 1
-            echo "domain:${item}"
+            if [[ "$item" =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+([a-z]{2,}|xn--[a-z0-9]{2,})$ ]]; then
+                echo "domain:${item}"
+                return 0
+            fi
+            return 1
             ;;
     esac
 }
@@ -1323,38 +1342,89 @@ route_add() {
     [ $# -gt 0 ] && shift
     local target
     if [ -z "$target_raw" ]; then
-        read_tty -p "选择目标出口 [v4=WARP IPv4 / v6=WARP IPv6 / direct=VPS直连] (默认 v4): " target_raw || return 0
-        [ -z "$target_raw" ] && target_raw="v4"
+        read_tty -p "选择目标出口 [v4=WARP IPv4 / v6=WARP IPv6 / direct=VPS直连，0/q 返回] (默认 v4): " target_raw || return 0
+        target_raw=$(echo "$target_raw" | tr -d ' \t\r\n')
+        case "$target_raw" in
+            0|q|Q|quit|exit)
+                echo -e "${YELLOW}已取消，返回路由菜单。${PLAIN}"
+                return 0
+                ;;
+            "") target_raw="v4" ;;
+        esac
     fi
     target=$(route_normalize_target "$target_raw") || {
         echo -e "${RED}❌ 不支持的出口标识: ${target_raw} (可选: v4, v6, direct)${PLAIN}"
         return 1
     }
 
-    local raw_inputs=()
+    local cli_mode=0 raw_inputs=()
     if [ $# -gt 0 ]; then
+        cli_mode=1
         raw_inputs=("$@")
-    else
-        local line=""
-        read_tty -p "请输入域名 (空格或逗号分隔, 如 paytr.com oyunfor.com): " line || return 0
-        line="${line//,/ }"
-        read -r -a raw_inputs <<< "$line"
     fi
 
-    local norm_domains=() item part norm
-    for item in "${raw_inputs[@]}"; do
-        for part in ${item//,/ }; do
-            norm=$(route_normalize_domain "$part") || continue
-            norm_domains+=("$norm")
+    local norm_domains=() bad_inputs=() item part norm
+    while true; do
+        norm_domains=()
+        bad_inputs=()
+        if [ "$cli_mode" -eq 0 ]; then
+            local line=""
+            read_tty -p "请输入域名 (空格/逗号分隔, 如 paytr.com oyunfor.com; 回车或 0/q 取消): " line || return 0
+            line=$(echo "$line" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+            case "$line" in
+                ""|0|q|Q|quit|exit)
+                    echo -e "${YELLOW}已取消，未做任何修改。${PLAIN}"
+                    return 0
+                    ;;
+            esac
+            line="${line//,/ }"
+            read -r -a raw_inputs <<< "$line"
+        fi
+
+        for item in "${raw_inputs[@]}"; do
+            for part in ${item//,/ }; do
+                [ -z "$part" ] && continue
+                if norm=$(route_normalize_domain "$part"); then
+                    norm_domains+=("$norm")
+                else
+                    bad_inputs+=("$part")
+                fi
+            done
         done
+
+        if [ ${#bad_inputs[@]} -gt 0 ]; then
+            echo -e "${RED}❌ 无效域名或规则格式: ${bad_inputs[*]}（示例: paytr.com 或 geosite:netflix）${PLAIN}"
+            if [ "$cli_mode" -eq 1 ]; then
+                return 1
+            fi
+            continue
+        fi
+        if [ ${#norm_domains[@]} -eq 0 ]; then
+            if [ "$cli_mode" -eq 1 ]; then
+                echo -e "${RED}❌ 未提供有效的域名规则！${PLAIN}"
+                return 1
+            fi
+            continue
+        fi
+        break
     done
-    if [ ${#norm_domains[@]} -eq 0 ]; then
-        echo -e "${RED}❌ 未提供有效的域名规则！${PLAIN}"
-        return 1
-    fi
 
     local items_json
-    items_json=$(printf '%s\n' "${norm_domains[@]}" | jq -R . | jq -s .)
+    items_json=$(printf '%s\n' "${norm_domains[@]}" | jq -R . | jq -s 'reduce .[] as $x ([]; if index($x) then . else . + [$x] end)')
+
+    if [ -f "$CONFIG" ] && command -v jq >/dev/null 2>&1; then
+        local outbound_ready=1
+        if [ "$target" = "warp-ipv4-out" ] || [ "$target" = "warp-ipv6-out" ]; then
+            jq -e --arg tag "$target" '.outbounds[]? | select(.tag == $tag and .protocol == "freedom")' "$CONFIG" >/dev/null 2>&1 || outbound_ready=0
+        fi
+        if [ "$outbound_ready" -eq 1 ] && jq -e --arg tag "$target" --argjson items "$items_json" '
+            [.routing.rules[]? | select(.outboundTag == $tag and (.domain | type == "array")) | .domain[]] as $cur
+            | ($items | all(. as $d | ($cur | index($d)) != null))
+        ' "$CONFIG" >/dev/null 2>&1; then
+            echo -e "${YELLOW}ℹ️ 以下规则已在 [${target}] 中，无需重复添加: ${norm_domains[*]}${PLAIN}"
+            return 0
+        fi
+    fi
     local jq_prog
     jq_prog="$(route_jq_prelude)
     (if (\$tag == \"warp-ipv4-out\" or \$tag == \"warp-ipv6-out\") then ensure_warp_ipv4 else . end)
@@ -1390,6 +1460,12 @@ route_add() {
 }
 
 route_del() {
+    [ -f "$CONFIG" ] || { echo -e "${RED}❌ 未找到配置文件 $CONFIG${PLAIN}"; return 1; }
+    if ! command -v jq >/dev/null 2>&1; then
+        echo -e "${RED}❌ 当前系统缺少 jq，无法修改分流规则！${PLAIN}"
+        return 1
+    fi
+
     local target_raw="${1:-}"
     [ $# -gt 0 ] && shift
     local target=""
@@ -1403,47 +1479,116 @@ route_del() {
         fi
     fi
 
-    local raw_inputs=()
+    local del_pairs_json="[]"
     if [ $# -gt 0 ]; then
-        raw_inputs=("$@")
-    else
-        local line=""
-        read_tty -p "请输入要移除的域名 (空格或逗号分隔, 如 paytr.com): " line || return 0
-        line="${line//,/ }"
-        read -r -a raw_inputs <<< "$line"
-    fi
-
-    local del_candidates=() item part stripped norm
-    for item in "${raw_inputs[@]}"; do
-        for part in ${item//,/ }; do
-            stripped=$(echo "$part" | tr -d ' \t\r\n')
-            [ -z "$stripped" ] && continue
-            del_candidates+=("$stripped")
-            if norm=$(route_normalize_domain "$stripped" 2>/dev/null); then
-                del_candidates+=("$norm")
-            fi
+        local item part stripped lowered norm specs=()
+        for item in "$@"; do
+            for part in ${item//,/ }; do
+                stripped=$(echo "$part" | tr -d ' \t\r\n')
+                [ -z "$stripped" ] && continue
+                lowered=$(echo "$stripped" | tr '[:upper:]' '[:lower:]')
+                specs+=("$(jq -nc --arg tag "$target" --arg dom "$stripped" '{tag:$tag, domain:$dom}')")
+                if norm=$(route_normalize_domain "$stripped" 2>/dev/null); then
+                    specs+=("$(jq -nc --arg tag "$target" --arg dom "$norm" '{tag:$tag, domain:$dom}')")
+                fi
+                case "$stripped" in
+                    domain:*|full:*) ;;
+                    *) specs+=("$(jq -nc --arg tag "$target" --arg dom "domain:${lowered}" '{tag:$tag, domain:$dom}')") ;;
+                esac
+            done
         done
-    done
-    if [ ${#del_candidates[@]} -eq 0 ]; then
-        echo -e "${RED}❌ 未提供要移除的域名！${PLAIN}"
-        return 1
+        if [ ${#specs[@]} -eq 0 ]; then
+            echo -e "${RED}❌ 未提供要移除的域名！${PLAIN}"
+            return 1
+        fi
+        del_pairs_json=$(printf '%s\n' "${specs[@]}" | jq -s 'unique')
+    else
+        local entries=() row idx=1 r_tag r_dom
+        while IFS=$'\t' read -r r_tag r_dom; do
+            [ -z "$r_tag" ] && continue
+            entries+=("${r_tag}"$'\t'"${r_dom}")
+        done < <(jq -r --arg tag "$target" '(.routing.rules // [])[] | select(($tag == "" or .outboundTag == $tag) and (.domain | type == "array")) | .outboundTag as $out | .domain[] | "\($out)\t\(.)"' "$CONFIG")
+
+        if [ ${#entries[@]} -eq 0 ]; then
+            echo -e "${YELLOW}ℹ️ 当前没有可移除的域名分流规则。${PLAIN}"
+            return 0
+        fi
+
+        echo -e "${CYAN}当前可移除的域名规则列表:${PLAIN}"
+        idx=1
+        for row in "${entries[@]}"; do
+            r_tag="${row%%$'\t'*}"
+            r_dom="${row#*$'\t'}"
+            local tag_note=""
+            [ "$r_dom" = "geosite:openai" ] || [ "$r_dom" = "geosite:google-deepmind" ] && tag_note=" ${YELLOW}[默认AI]${PLAIN}"
+            echo -e "  ${GREEN}[${idx}]${PLAIN} (${CYAN}${r_tag}${PLAIN}) ${r_dom}${tag_note}"
+            idx=$((idx + 1))
+        done
+
+        local line="" raw_inputs=() specs=() part stripped lowered norm sel_idx sel_row invalid=0
+        while true; do
+            specs=()
+            invalid=0
+            read_tty -p "请输入要移除的序号或域名 (空格/逗号分隔; 回车或 0/q 取消): " line || return 0
+            line=$(echo "$line" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+            case "$line" in
+                ""|0|q|Q|quit|exit)
+                    echo -e "${YELLOW}已取消，未做任何修改。${PLAIN}"
+                    return 0
+                    ;;
+            esac
+            line="${line//,/ }"
+            read -r -a raw_inputs <<< "$line"
+            for part in "${raw_inputs[@]}"; do
+                stripped=$(echo "$part" | tr -d ' \t\r\n')
+                [ -z "$stripped" ] && continue
+                if [[ "$stripped" =~ ^[1-9][0-9]*$ ]]; then
+                    sel_idx=$((stripped - 1))
+                    if [ "$sel_idx" -ge 0 ] && [ "$sel_idx" -lt "${#entries[@]}" ]; then
+                        sel_row="${entries[$sel_idx]}"
+                        r_tag="${sel_row%%$'\t'*}"
+                        r_dom="${sel_row#*$'\t'}"
+                        specs+=("$(jq -nc --arg tag "$r_tag" --arg dom "$r_dom" '{tag:$tag, domain:$dom}')")
+                    else
+                        echo -e "${RED}❌ 序号超出范围: ${stripped} (可选 1-${#entries[@]})${PLAIN}"
+                        invalid=1
+                    fi
+                else
+                    lowered=$(echo "$stripped" | tr '[:upper:]' '[:lower:]')
+                    specs+=("$(jq -nc --arg tag "$target" --arg dom "$stripped" '{tag:$tag, domain:$dom}')")
+                    if norm=$(route_normalize_domain "$stripped" 2>/dev/null); then
+                        specs+=("$(jq -nc --arg tag "$target" --arg dom "$norm" '{tag:$tag, domain:$dom}')")
+                    fi
+                    specs+=("$(jq -nc --arg tag "$target" --arg dom "domain:${lowered}" '{tag:$tag, domain:$dom}')")
+                fi
+            done
+            [ "$invalid" -eq 1 ] && continue
+            [ ${#specs[@]} -gt 0 ] && break
+        done
+        del_pairs_json=$(printf '%s\n' "${specs[@]}" | jq -s 'unique')
     fi
 
-    local items_json
-    items_json=$(printf '%s\n' "${del_candidates[@]}" | jq -R . | jq -s 'unique')
+    if ! jq -e --argjson specs "$del_pairs_json" '
+        [(.routing.rules // [])[] | select(.domain | type == "array") | .outboundTag as $out | .domain[] | select(. as $d | any($specs[]; (.tag == "" or .tag == $out) and .domain == $d))] | length > 0
+    ' "$CONFIG" >/dev/null 2>&1; then
+        echo -e "${YELLOW}⚠️ 未在当前分流规则中找到匹配项（未修改配置，无需重启）。${PLAIN}"
+        return 0
+    fi
+
     local jq_prog='
     .routing.rules |= (
       (. // [])
       | map(
-          if ($tag == "" or .outboundTag == $tag) and (.domain | type == "array") then
-            .domain |= (. - $items)
+          if (.domain | type == "array") then
+            .outboundTag as $out
+            | .domain |= map(select(. as $d | (any($specs[]; (.tag == "" or .tag == $out) and .domain == $d) | not)))
           else . end
         )
       | map(select((.domain | type != "array") or (.domain | length > 0)))
     )'
 
-    if route_apply_jq "$jq_prog" --arg tag "$target" --argjson items "$items_json"; then
-        echo -e "${GREEN}✅ 已更新分流规则并重载 Xray！${PLAIN}"
+    if route_apply_jq "$jq_prog" --argjson specs "$del_pairs_json"; then
+        echo -e "${GREEN}✅ 已移除匹配的分流规则并重载 Xray！${PLAIN}"
     fi
 }
 
@@ -1464,26 +1609,34 @@ manage_routes() {
             route_del "$@"
             ;;
         "")
-            route_list || true
-            echo ""
-            echo -e "${CYAN}分流路由管理 (Xray Outbound & Routing):${PLAIN}"
-            echo -e "  ${GREEN}1.${PLAIN} 添加域名走 WARP IPv4 出口 (${CYAN}warp-ipv4-out${PLAIN})"
-            echo -e "  ${GREEN}2.${PLAIN} 添加域名走 WARP IPv6 出口 (${CYAN}warp-ipv6-out${PLAIN})"
-            echo -e "  ${GREEN}3.${PLAIN} 添加域名走 VPS 直连出口 (${CYAN}direct${PLAIN})"
-            echo -e "  ${GREEN}4.${PLAIN} 移除已添加的分流域名"
-            echo -e "  ${GREEN}5.${PLAIN} 为旧配置自动补全 warp-ipv4-out 出站"
-            echo -e "  ${GREEN}0.${PLAIN} 返回主菜单"
-            local choice=""
-            read_tty -p "请选择 [0-5]: " choice || return 0
-            case "$choice" in
-                1) route_add "v4" ;;
-                2) route_add "v6" ;;
-                3) route_add "direct" ;;
-                4) route_del ;;
-                5) route_ensure_warp_v4 ;;
-                0|"") return 0 ;;
-                *) echo -e "${RED}无效选项${PLAIN}"; return 1 ;;
-            esac
+            while true; do
+                echo ""
+                route_list || true
+                echo ""
+                echo -e "${CYAN}分流路由管理 (Xray Outbound & Routing):${PLAIN}"
+                echo -e "  ${GREEN}1.${PLAIN} 添加域名走 WARP IPv4 出口 (${CYAN}warp-ipv4-out${PLAIN})"
+                echo -e "  ${GREEN}2.${PLAIN} 添加域名走 WARP IPv6 出口 (${CYAN}warp-ipv6-out${PLAIN})"
+                echo -e "  ${GREEN}3.${PLAIN} 添加域名走 VPS 直连出口 (${CYAN}direct${PLAIN})"
+                echo -e "  ${GREEN}4.${PLAIN} 移除分流域名规则（支持序号/域名）"
+                if [ -f "$CONFIG" ] && command -v jq >/dev/null 2>&1 && jq -e '.outbounds[]? | select(.tag == "warp-ipv4-out")' "$CONFIG" >/dev/null 2>&1; then
+                    echo -e "  ${GREEN}5.${PLAIN} 为旧配置自动补全 warp-ipv4-out 出站 ${GREEN}[已就绪]${PLAIN}"
+                else
+                    echo -e "  ${GREEN}5.${PLAIN} 为旧配置自动补全 warp-ipv4-out 出站 ${YELLOW}[待补全]${PLAIN}"
+                fi
+                echo -e "  ${GREEN}0.${PLAIN} 返回主菜单"
+                local choice=""
+                read_tty -p "请选择 [0-5]: " choice || return 0
+                choice=$(echo "$choice" | tr -d ' \t\r\n')
+                case "$choice" in
+                    1) route_add "v4" || true ;;
+                    2) route_add "v6" || true ;;
+                    3) route_add "direct" || true ;;
+                    4) route_del || true ;;
+                    5) route_ensure_warp_v4 || true ;;
+                    0|"") return 0 ;;
+                    *) echo -e "${RED}无效选项，请重新输入！${PLAIN}" ;;
+                esac
+            done
             ;;
         *)
             echo "用法:"
@@ -2962,7 +3115,7 @@ menu() {
             15) manage_warp ;;
             16) update_xm_script 1 ;;
             17) manage_ssh ;;
-            18) manage_routes ;;
+            18) manage_routes; continue ;;
             19) uninstall_xray ;;
             0) exit 0 ;;
             *) echo -e "${RED}输入无效，请重新输入！${PLAIN}" ;;
