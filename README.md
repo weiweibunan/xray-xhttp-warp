@@ -123,6 +123,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/weiweibunan/xray-xhttp-warp/
 | `xm loglevel <级别>` | 一键切换 Xray 日志级别（`error` / `warning` / `info` / `debug`） |
 | `xm uuid [UUID]` | 更换或自定义指定用户 UUID（无参数时支持回车随机新建或输入旧 UUID 复用） |
 | `xm tunnel` | （原生 VPS 模式）可选开启、更新、查看或关闭附加 Cloudflare Tunnel 隧道 |
+| `xm hy2` | （原生 VPS 模式）可选开启、更新、查看或关闭 Hysteria2 协议节点（支持 UDP 端口 / Salamander 混淆 / Brutal 带宽） |
 | `xm token` | 更新 Cloudflare Tunnel Token 密钥与域名（纯隧道模式 / 已开启附加隧道时） |
 | `xm cert` | 证书管理（`xm cert status` 查看、`xm cert issue` 申请/更换并应用、`xm cert renew` 强制续期） |
 | `xm bbr` | 一键开启/检查系统 TCP BBR 拥塞控制加速 |

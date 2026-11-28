@@ -352,6 +352,14 @@ show_info() {
         echo -e "${YELLOW}vless://${uuid}@${CDN_HOST}:443?encryption=none&security=tls&sni=${tun_dom}&host=${tun_dom}&type=xhttp&path=${path_xt}&mode=auto#XHTTP-CF-Tunnel-优选${PLAIN}"
         echo -e "  💡 Zero Trust Public Hostname (${CYAN}${tun_dom}${PLAIN}) 请指向: ${GREEN}HTTP -> 127.0.0.1:${port_xt}${PLAIN}"
     fi
+    local hy2_uri hy2_port
+    hy2_uri=$(hy2_build_share_uri "$ip" 2>/dev/null || true)
+    if [ -n "$hy2_uri" ]; then
+        hy2_port=$(get_inbound_field "hysteria2-in" "port")
+        echo -e "--------------------------------------------------"
+        echo -e "${GREEN}⚡ 附加节点：【Hysteria2 - UDP 加速 (${hy2_port:-443}/udp)】${PLAIN}(抗弱网丢包/共用分流规则)"
+        echo -e "${YELLOW}${hy2_uri}${PLAIN}"
+    fi
     echo -e "${BLUE}==================================================${PLAIN}"
 }
 
@@ -1010,6 +1018,536 @@ manage_native_tunnel() {
             ;;
         *)
             echo "用法: xm tunnel [enable|status|disable]"
+            return 1
+            ;;
+    esac
+}
+
+hy2_uri_encode() {
+    local raw="${1:-}"
+    if command -v jq >/dev/null 2>&1; then
+        jq -rn --arg v "$raw" '$v|@uri'
+    else
+        echo "$raw"
+    fi
+}
+
+hy2_random_secret() {
+    tr -dc 'A-Za-z0-9' < /dev/urandom 2>/dev/null | head -c 16
+}
+
+hy2_check_udp_port_conflict() {
+    local port="$1" h3_port="${2:-}" cur_hy2_port="${3:-}" line=""
+    if [ -n "$h3_port" ] && [ "$port" = "$h3_port" ]; then
+        echo "与原生 XHTTP-H3 UDP 端口 (${h3_port}) 冲突"
+        return 0
+    fi
+    if command -v ss >/dev/null 2>&1; then
+        line=$(ss -ulnp 2>/dev/null | grep -E ":${port}[[:space:]]" || true)
+    elif command -v netstat >/dev/null 2>&1; then
+        line=$(netstat -ulnp 2>/dev/null | grep -E ":${port}[[:space:]]" || true)
+    else
+        return 1
+    fi
+    [ -z "$line" ] && return 1
+    if echo "$line" | grep -qE '"xray"|[0-9]+/xray' && [ -n "$cur_hy2_port" ] && [ "$port" = "$cur_hy2_port" ]; then
+        return 1
+    fi
+    echo "$line"
+    return 0
+}
+
+hy2_cert_is_trusted_domain() {
+    local cert_file="$1" sni="${2:-}" issuer="" subj=""
+    [ -f "$cert_file" ] || return 1
+    [ -n "$sni" ] || return 1
+    [[ "$sni" == \*.* ]] && return 1
+    [[ "$sni" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ || "$sni" == *:* ]] && return 1
+    issuer=$(openssl x509 -in "$cert_file" -noout -issuer 2>/dev/null | sed 's/^issuer=//' || true)
+    subj=$(openssl x509 -in "$cert_file" -noout -subject 2>/dev/null | sed 's/^subject=//' || true)
+    [ -n "$issuer" ] && [ "$issuer" = "$subj" ] && return 1
+    return 0
+}
+
+hy2_ensure_cert() {
+    local force_self="${1:-0}" ip="${2:-127.0.0.1}"
+    local cert_file key_file
+    cert_file=$(get_inbound_field "xhttp-cdn-443-in" "cert")
+    if [ -n "$cert_file" ] && [ -f "$cert_file" ]; then
+        key_file=$(jq -r '(.inbounds // [])[] | select(.tag=="xhttp-cdn-443-in") | .streamSettings.tlsSettings.certificates[0].keyFile // empty' "$CONFIG" 2>/dev/null | head -n1)
+        if [ -n "$key_file" ] && [ -f "$key_file" ]; then
+            HY2_CERT_FILE="$cert_file"
+            HY2_KEY_FILE="$key_file"
+            return 0
+        fi
+    fi
+    if [ -f "/etc/xray/cert/cert.crt" ] && [ -f "/etc/xray/cert/private.key" ]; then
+        HY2_CERT_FILE="/etc/xray/cert/cert.crt"
+        HY2_KEY_FILE="/etc/xray/cert/private.key"
+        return 0
+    fi
+    if [ -f "/etc/xray/cert/hy2_self.crt" ] && [ -f "/etc/xray/cert/hy2_self.key" ]; then
+        HY2_CERT_FILE="/etc/xray/cert/hy2_self.crt"
+        HY2_KEY_FILE="/etc/xray/cert/hy2_self.key"
+        return 0
+    fi
+
+    if [ "$force_self" != "1" ]; then
+        echo -e "${YELLOW}⚠️ 未检测到 /etc/xray/cert/cert.crt 域名证书。${PLAIN}"
+        echo -e "  ${GREEN}1.${PLAIN} 生成自签名 EC 证书 (即开即用，分享链接自动带 insecure=1)"
+        echo -e "  ${GREEN}2.${PLAIN} 前往申请正式域名证书 (xm cert issue)"
+        echo -e "  ${GREEN}0.${PLAIN} 取消"
+        local c=""
+        read_tty -p "请选择 [0-2，默认 1]: " c || return 1
+        c=$(echo "$c" | tr -d ' \t\r\n')
+        [ -z "$c" ] && c="1"
+        case "$c" in
+            1) ;;
+            2)
+                manage_cert issue || return 1
+                if [ -f "/etc/xray/cert/cert.crt" ] && [ -f "/etc/xray/cert/private.key" ]; then
+                    HY2_CERT_FILE="/etc/xray/cert/cert.crt"
+                    HY2_KEY_FILE="/etc/xray/cert/private.key"
+                    return 0
+                fi
+                return 1
+                ;;
+            *) return 1 ;;
+        esac
+    fi
+
+    if ! command -v openssl >/dev/null 2>&1; then
+        echo -e "${RED}❌ 缺少 openssl，无法生成自签名证书！${PLAIN}"
+        return 1
+    fi
+    mkdir -p /etc/xray/cert
+    if openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -days 3650 -nodes \
+        -subj "/CN=${ip}" -keyout /etc/xray/cert/hy2_self.key -out /etc/xray/cert/hy2_self.crt >/dev/null 2>&1; then
+        chmod 600 /etc/xray/cert/hy2_self.key
+        chmod 644 /etc/xray/cert/hy2_self.crt
+        HY2_CERT_FILE="/etc/xray/cert/hy2_self.crt"
+        HY2_KEY_FILE="/etc/xray/cert/hy2_self.key"
+        echo -e "${GREEN}✅ 已生成 Hysteria2 自签名证书: /etc/xray/cert/hy2_self.crt${PLAIN}"
+        return 0
+    fi
+    echo -e "${RED}❌ 生成自签名证书失败！${PLAIN}"
+    return 1
+}
+
+hy2_build_share_uri() {
+    local ip_arg="${1:-}"
+    [ -f "$CONFIG" ] && command -v jq >/dev/null 2>&1 || return 1
+    local hy2_json
+    hy2_json=$(jq -c '(.inbounds // [])[] | select(.tag=="hysteria2-in")' "$CONFIG" 2>/dev/null | head -n1 || true)
+    [ -n "$hy2_json" ] || return 1
+
+    local port auth obfs_pw cert_file sni ip host_addr sni_qs insecure_flag=0 qs=""
+    port=$(echo "$hy2_json" | jq -r '.port // empty')
+    auth=$(echo "$hy2_json" | jq -r '.settings.clients[0].auth // .settings.users[0].auth // .streamSettings.hysteriaSettings.auth // empty')
+    obfs_pw=$(echo "$hy2_json" | jq -r '(.streamSettings.finalmask.udp // [])[]? | select(.type=="salamander") | .settings.password // empty' | head -n1)
+    cert_file=$(echo "$hy2_json" | jq -r '.streamSettings.tlsSettings.certificates[0].certificateFile // empty')
+    [ -z "$port" ] || [ -z "$auth" ] && return 1
+
+    ip="${ip_arg:-$(fetch_public_ip)}"
+    sni=$(extract_sni_from_cert "$cert_file")
+    if hy2_cert_is_trusted_domain "$cert_file" "$sni"; then
+        host_addr=$(format_host_for_url "$sni")
+        sni_qs="$sni"
+        insecure_flag=0
+    else
+        host_addr=$(format_host_for_url "$ip")
+        if [ -n "$sni" ] && [[ "$sni" != \*.* ]]; then
+            sni_qs="$sni"
+        else
+            sni_qs=""
+        fi
+        insecure_flag=1
+    fi
+
+    [ -n "$sni_qs" ] && qs="${qs:+${qs}&}sni=$(hy2_uri_encode "$sni_qs")"
+    [ "$insecure_flag" -eq 1 ] && qs="${qs:+${qs}&}insecure=1"
+    if [ -n "$obfs_pw" ]; then
+        qs="${qs:+${qs}&}obfs=salamander&obfs-password=$(hy2_uri_encode "$obfs_pw")"
+    fi
+
+    local auth_enc
+    auth_enc=$(hy2_uri_encode "$auth")
+    if [ -n "$qs" ]; then
+        echo "hysteria2://${auth_enc}@${host_addr}:${port}/?${qs}#Hysteria2-${port}"
+    else
+        echo "hysteria2://${auth_enc}@${host_addr}:${port}/#Hysteria2-${port}"
+    fi
+}
+
+hy2_show_status() {
+    [ -f "$CONFIG" ] || { echo -e "${RED}❌ 未找到配置文件 $CONFIG！${PLAIN}"; return 1; }
+    if ! command -v jq >/dev/null 2>&1; then
+        echo -e "${RED}❌ 缺少 jq，无法解析 Hysteria2 状态！${PLAIN}"
+        return 1
+    fi
+    local hy2_json
+    hy2_json=$(jq -c '(.inbounds // [])[] | select(.tag=="hysteria2-in")' "$CONFIG" 2>/dev/null | head -n1 || true)
+    echo -e "${BLUE}==================================================${PLAIN}"
+    echo -e "${GREEN}           Hysteria2 协议节点状态                 ${PLAIN}"
+    echo -e "${BLUE}==================================================${PLAIN}"
+    if [ -z "$hy2_json" ]; then
+        echo -e "  节点状态   : ${YELLOW}未开启${PLAIN}"
+        echo -e "  开启提示   : 执行 ${GREEN}xm hy2 enable${PLAIN} 即可一键开启 Hysteria2 节点。"
+        echo -e "${BLUE}==================================================${PLAIN}"
+        return 0
+    fi
+    local port auth obfs_pw cert_file brutal_up brutal_down share_uri
+    port=$(echo "$hy2_json" | jq -r '.port // "未知"')
+    auth=$(echo "$hy2_json" | jq -r '.settings.clients[0].auth // .settings.users[0].auth // .streamSettings.hysteriaSettings.auth // "未知"')
+    obfs_pw=$(echo "$hy2_json" | jq -r '(.streamSettings.finalmask.udp // [])[]? | select(.type=="salamander") | .settings.password // empty' | head -n1)
+    cert_file=$(echo "$hy2_json" | jq -r '.streamSettings.tlsSettings.certificates[0].certificateFile // "未知"')
+    brutal_up=$(echo "$hy2_json" | jq -r '.streamSettings.finalmask.quicParams.brutalUp // empty')
+    brutal_down=$(echo "$hy2_json" | jq -r '.streamSettings.finalmask.quicParams.brutalDown // empty')
+    share_uri=$(hy2_build_share_uri || true)
+
+    echo -e "  节点状态   : ${GREEN}已开启 (Xray 原生 Hysteria2)${PLAIN}"
+    echo -e "  UDP 端口   : ${CYAN}${port}/udp${PLAIN}"
+    echo -e "  认证密码   : ${CYAN}${auth}${PLAIN}"
+    if [ -n "$obfs_pw" ]; then
+        echo -e "  UDP 混淆   : ${GREEN}salamander${PLAIN} (密码: ${CYAN}${obfs_pw}${PLAIN})"
+    else
+        echo -e "  UDP 混淆   : ${YELLOW}未开启 (标准 QUIC 伪装)${PLAIN}"
+    fi
+    if [ -n "$brutal_up" ] || [ -n "$brutal_down" ]; then
+        echo -e "  Brutal 限速: ${CYAN}上行 ${brutal_up:-默认} / 下行 ${brutal_down:-默认}${PLAIN}"
+    else
+        echo -e "  拥塞控制   : ${CYAN}默认自适应${PLAIN}"
+    fi
+    echo -e "  TLS 证书   : ${CYAN}${cert_file}${PLAIN}"
+    [ -n "$share_uri" ] && echo -e "  分享链接   : ${YELLOW}${share_uri}${PLAIN}"
+    echo -e "${BLUE}==================================================${PLAIN}"
+}
+
+hy2_enable() {
+    load_tunnel_meta
+    if [ "$TUNNEL_MODE" = "1" ]; then
+        echo -e "${RED}❌ 当前处于容器/Cloudflare Tunnel 穿透模式！${PLAIN}"
+        echo -e "${YELLOW}💡 Cloudflare Tunnel 仅支持 HTTP/TCP 代理，无法转发 Hysteria2 所需的公网 UDP 流量；请先在具备公网 UDP 端口的原生 VPS 上运行 xm hy2。${PLAIN}"
+        return 1
+    fi
+    [ -f "$CONFIG" ] || { echo -e "${RED}❌ 未找到配置文件 $CONFIG，请先完成 Xray 安装！${PLAIN}"; return 1; }
+    if ! command -v jq >/dev/null 2>&1; then
+        echo -e "${RED}❌ 当前系统缺少 jq，请先安装 jq (apt/yum install -y jq) 后重试！${PLAIN}"
+        return 1
+    fi
+
+    local cli_port="" cli_auth="" cli_obfs="" cli_brutal="" no_obfs=0 auto_yes=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --port|-p) [ $# -ge 2 ] || { echo -e "${RED}❌ --port 缺少参数！${PLAIN}"; return 1; }; cli_port="$2"; shift 2 ;;
+            --auth|-a) [ $# -ge 2 ] || { echo -e "${RED}❌ --auth 缺少参数！${PLAIN}"; return 1; }; cli_auth="$2"; shift 2 ;;
+            --obfs) [ $# -ge 2 ] || { echo -e "${RED}❌ --obfs 缺少参数！${PLAIN}"; return 1; }; cli_obfs="$2"; shift 2 ;;
+            --no-obfs) no_obfs=1; shift ;;
+            --brutal) [ $# -ge 2 ] || { echo -e "${RED}❌ --brutal 缺少参数！${PLAIN}"; return 1; }; cli_brutal="$2"; shift 2 ;;
+            --yes|-y) auto_yes=1; shift ;;
+            *) echo -e "${RED}❌ 未知参数: $1${PLAIN}"; return 1 ;;
+        esac
+    done
+
+    local cur_hy2_json cur_port cur_auth cur_obfs cur_up cur_down h3_port default_port ip
+    cur_hy2_json=$(jq -c '(.inbounds // [])[] | select(.tag=="hysteria2-in")' "$CONFIG" 2>/dev/null | head -n1 || true)
+    cur_port=$(echo "$cur_hy2_json" | jq -r '.port // empty' 2>/dev/null || true)
+    cur_auth=$(echo "$cur_hy2_json" | jq -r '.settings.clients[0].auth // .settings.users[0].auth // empty' 2>/dev/null || true)
+    cur_obfs=$(echo "$cur_hy2_json" | jq -r '(.streamSettings.finalmask.udp // [])[]? | select(.type=="salamander") | .settings.password // empty' 2>/dev/null | head -n1 || true)
+    cur_up=$(echo "$cur_hy2_json" | jq -r '.streamSettings.finalmask.quicParams.brutalUp // empty' 2>/dev/null | grep -oE '[0-9]+' | head -n1 || true)
+    cur_down=$(echo "$cur_hy2_json" | jq -r '.streamSettings.finalmask.quicParams.brutalDown // empty' 2>/dev/null | grep -oE '[0-9]+' | head -n1 || true)
+    h3_port=$(get_inbound_field "xhttp-h3-in" "port")
+    ip=$(fetch_public_ip)
+
+    if [ -n "$cur_port" ]; then
+        default_port="$cur_port"
+    elif ! hy2_check_udp_port_conflict 443 "$h3_port" "$cur_port" >/dev/null; then
+        default_port="443"
+    else
+        default_port="18443"
+    fi
+
+    local hy2_port="" hy2_auth="" hy2_obfs="" brutal_up="" brutal_down="" conflict=""
+    if [ -n "$cli_port" ]; then
+        if [[ ! "$cli_port" =~ ^[0-9]+$ ]] || [ "$cli_port" -lt 1 ] || [ "$cli_port" -gt 65535 ]; then
+            echo -e "${RED}❌ 无效 UDP 端口: ${cli_port}${PLAIN}"; return 1
+        fi
+        if conflict=$(hy2_check_udp_port_conflict "$cli_port" "$h3_port" "$cur_port"); then
+            echo -e "${RED}❌ UDP 端口 ${cli_port} 不可用: ${conflict}${PLAIN}"; return 1
+        fi
+        hy2_port="$cli_port"
+    elif [ "$auto_yes" -eq 1 ]; then
+        if conflict=$(hy2_check_udp_port_conflict "$default_port" "$h3_port" "$cur_port"); then
+            echo -e "${RED}❌ 默认 UDP 端口 ${default_port} 不可用: ${conflict}${PLAIN}"; return 1
+        fi
+        hy2_port="$default_port"
+    else
+        while true; do
+            local input_port=""
+            read_tty -p "请输入 Hysteria2 UDP 监听端口 [1-65535，默认 ${default_port}，输入 0 取消]: " input_port || return 1
+            input_port=$(echo "$input_port" | tr -d ' \r\n')
+            [ "$input_port" = "0" ] && { echo -e "${YELLOW}已取消操作。${PLAIN}"; return 0; }
+            [ -z "$input_port" ] && input_port="$default_port"
+            if [[ ! "$input_port" =~ ^[0-9]+$ ]] || [ "$input_port" -lt 1 ] || [ "$input_port" -gt 65535 ]; then
+                echo -e "${RED}❌ 端口必须是 1-65535 之间的整数！${PLAIN}"
+                continue
+            fi
+            if conflict=$(hy2_check_udp_port_conflict "$input_port" "$h3_port" "$cur_port"); then
+                echo -e "${RED}❌ UDP 端口 ${input_port} 已被占用: ${conflict}${PLAIN}"
+                continue
+            fi
+            hy2_port="$input_port"
+            break
+        done
+    fi
+
+    if [ -n "$cli_auth" ]; then
+        hy2_auth="$cli_auth"
+    elif [ "$auto_yes" -eq 1 ]; then
+        hy2_auth="${cur_auth:-$(hy2_random_secret)}"
+    else
+        local def_auth_hint="回车随机生成"
+        [ -n "$cur_auth" ] && def_auth_hint="回车保持现有"
+        local input_auth=""
+        read_tty -p "请输入 Hysteria2 认证密码 [${def_auth_hint}]: " input_auth || return 1
+        input_auth=$(echo "$input_auth" | tr -d '\r\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+        if [ -n "$input_auth" ]; then
+            hy2_auth="$input_auth"
+        else
+            hy2_auth="${cur_auth:-$(hy2_random_secret)}"
+        fi
+    fi
+
+    if [ "$no_obfs" -eq 1 ]; then
+        hy2_obfs=""
+    elif [ -n "$cli_obfs" ]; then
+        hy2_obfs="$cli_obfs"
+    elif [ "$auto_yes" -eq 1 ]; then
+        hy2_obfs="$cur_obfs"
+    else
+        local obfs_ans="" obfs_def="y/N"
+        [ -n "$cur_obfs" ] && obfs_def="Y/n"
+        read_tty -p "是否启用 Salamander UDP 混淆？(抗 UDP QoS，部分精简客户端需单独支持) [${obfs_def}]: " obfs_ans || obfs_ans=""
+        if { [ -n "$cur_obfs" ] && [[ "$obfs_ans" != "n" && "$obfs_ans" != "N" ]]; } || { [ -z "$cur_obfs" ] && [[ "$obfs_ans" == "y" || "$obfs_ans" == "Y" ]]; }; then
+            local input_obfs="" o_hint="回车随机生成"
+            [ -n "$cur_obfs" ] && o_hint="回车保持现有"
+            read_tty -p "请输入 Salamander 混淆密码 [${o_hint}]: " input_obfs || return 1
+            input_obfs=$(echo "$input_obfs" | tr -d '\r\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+            if [ -n "$input_obfs" ]; then
+                hy2_obfs="$input_obfs"
+            else
+                hy2_obfs="${cur_obfs:-$(hy2_random_secret)}"
+            fi
+        else
+            hy2_obfs=""
+        fi
+    fi
+
+    local brutal_raw=""
+    if [ -n "$cli_brutal" ]; then
+        [ "$cli_brutal" != "0" ] && [ "$cli_brutal" != "off" ] && brutal_raw="$cli_brutal"
+    elif [ "$auto_yes" -ne 1 ]; then
+        if [ -n "$cur_up" ] && [ -n "$cur_down" ]; then
+            read_tty -p "可选 Brutal 上下行带宽 Mbps [回车保持现有 ${cur_up}/${cur_down}，输入 0 关闭]: " brutal_raw || brutal_raw=""
+            brutal_raw=$(echo "$brutal_raw" | tr -d ' \r\n')
+            if [ -z "$brutal_raw" ]; then
+                brutal_raw="${cur_up}/${cur_down}"
+            elif [ "$brutal_raw" = "0" ] || [ "$brutal_raw" = "off" ]; then
+                brutal_raw=""
+            fi
+        else
+            read_tty -p "可选 Brutal 上下行带宽 Mbps（如 100/200，回车不限制使用默认）: " brutal_raw || brutal_raw=""
+            brutal_raw=$(echo "$brutal_raw" | tr -d ' \r\n')
+        fi
+    elif [ -n "$cur_up" ] && [ -n "$cur_down" ]; then
+        brutal_raw="${cur_up}/${cur_down}"
+    fi
+    if [ -n "$brutal_raw" ]; then
+        if [[ "$brutal_raw" =~ ^([1-9][0-9]*)/([1-9][0-9]*)$ ]]; then
+            brutal_up="${BASH_REMATCH[1]} mbps"
+            brutal_down="${BASH_REMATCH[2]} mbps"
+        else
+            echo -e "${RED}❌ Brutal 带宽格式无效 (${brutal_raw})，应为 上行/下行 数字，如 100/200！${PLAIN}"
+            return 1
+        fi
+    fi
+
+    HY2_CERT_FILE=""
+    HY2_KEY_FILE=""
+    hy2_ensure_cert "$auto_yes" "$ip" || return 1
+
+    local finalmask_json="{}"
+    if [ -n "$hy2_obfs" ]; then
+        finalmask_json=$(jq -cn --argjson fm "$finalmask_json" --arg pw "$hy2_obfs" '$fm + {udp:[{type:"salamander",settings:{password:$pw}}]}')
+    fi
+    if [ -n "$brutal_up" ] && [ -n "$brutal_down" ]; then
+        finalmask_json=$(jq -cn --argjson fm "$finalmask_json" --arg up "$brutal_up" --arg down "$brutal_down" '$fm + {quicParams:{congestion:"brutal",brutalUp:$up,brutalDown:$down}}')
+    fi
+
+    local hy2_inbound_json
+    hy2_inbound_json=$(jq -cn \
+        --argjson port "$hy2_port" \
+        --arg auth "$hy2_auth" \
+        --arg cert "$HY2_CERT_FILE" \
+        --arg key "$HY2_KEY_FILE" \
+        --argjson fm "$finalmask_json" '
+        {
+            "tag": "hysteria2-in",
+            "listen": "::",
+            "port": $port,
+            "protocol": "hysteria",
+            "settings": {
+                "version": 2,
+                "clients": [{"auth": $auth}]
+            },
+            "streamSettings": (
+                {
+                    "network": "hysteria",
+                    "security": "tls",
+                    "tlsSettings": {
+                        "alpn": ["h3"],
+                        "certificates": [{"certificateFile": $cert, "keyFile": $key}]
+                    },
+                    "hysteriaSettings": {
+                        "version": 2,
+                        "udpIdleTimeout": 60
+                    }
+                } + (if ($fm | length) > 0 then {"finalmask": $fm} else {} end)
+            ),
+            "sniffing": {
+                "enabled": true,
+                "destOverride": ["http", "tls", "quic"],
+                "metadataOnly": false
+            }
+        }
+    ')
+
+    local tmp_dir tmp_cfg err_out=""
+    tmp_dir=$(mktemp -d)
+    tmp_cfg="${tmp_dir}/config.json"
+    jq --argjson hy2 "$hy2_inbound_json" '
+        .inbounds = ((.inbounds // []) | map(select(.tag != "hysteria2-in")) + [$hy2])
+    ' "$CONFIG" > "$tmp_cfg"
+
+    if ! err_out=$(XRAY_LOCATION_ASSET="$XRAY_ASSET_DIR" "$XRAY_BIN" run -test -c "$tmp_cfg" 2>&1); then
+        if echo "$err_out" | grep -qiE 'unknown protocol|hysteria'; then
+            echo -e "${YELLOW}⚠️ 当前 Xray 内核校验 Hysteria2 失败，可能版本过旧（原生 Hysteria2 需要新版 Xray-core）：${PLAIN}"
+            echo "$err_out"
+            if [ "$auto_yes" -ne 1 ]; then
+                local up_ans=""
+                read_tty -p "是否立即升级 Xray 官方最新内核后重试？[Y/n]: " up_ans || up_ans="n"
+                if [[ -z "$up_ans" || "$up_ans" == "y" || "$up_ans" == "Y" ]]; then
+                    if upgrade_core && XRAY_LOCATION_ASSET="$XRAY_ASSET_DIR" "$XRAY_BIN" run -test -c "$tmp_cfg" >/dev/null 2>&1; then
+                        :
+                    else
+                        rm -rf "$tmp_dir"
+                        echo -e "${RED}❌ 升级后配置校验仍失败，已保留原配置！${PLAIN}"
+                        return 1
+                    fi
+                else
+                    rm -rf "$tmp_dir"
+                    return 1
+                fi
+            else
+                rm -rf "$tmp_dir"
+                echo -e "${RED}❌ 请先运行 xm update-core 升级 Xray 内核后重试！${PLAIN}"
+                return 1
+            fi
+        else
+            rm -rf "$tmp_dir"
+            echo -e "${RED}❌ Xray 配置校验失败，已回滚未做更改：${PLAIN}"
+            echo "$err_out"
+            return 1
+        fi
+    fi
+
+    chmod 644 "$tmp_cfg"
+    mv -f "$tmp_cfg" "$CONFIG"
+    rm -rf "$tmp_dir"
+
+    open_firewall_port_xm udp "$hy2_port"
+    restart_xray
+    echo -e "${GREEN}✅ Hysteria2 节点配置已生效（自动共享当前 WARP AI / xm route 分流规则）！${PLAIN}"
+    hy2_show_status
+    echo -e "${YELLOW}💡 云服务器请确认安全组/外层防火墙已放行 UDP 端口: ${hy2_port}/udp${PLAIN}"
+}
+
+hy2_disable() {
+    local flag="${1:-}"
+    [ -f "$CONFIG" ] || { echo -e "${RED}❌ 未找到配置文件 $CONFIG${PLAIN}"; return 1; }
+    if ! command -v jq >/dev/null 2>&1; then
+        echo -e "${RED}❌ 当前系统缺少 jq，无法移除 Hysteria2 入站！${PLAIN}"
+        return 1
+    fi
+    if ! jq -e '(.inbounds // []) | any(.tag == "hysteria2-in")' "$CONFIG" >/dev/null 2>&1; then
+        echo -e "${YELLOW}💡 当前未开启 Hysteria2 节点，无需关闭。${PLAIN}"
+        return 0
+    fi
+    if [ "$flag" != "--yes" ] && [ "$flag" != "-y" ]; then
+        local confirm=""
+        read_tty -p "⚠️ 确认关闭并移除 Hysteria2 节点吗？[y/N]: " confirm || return 0
+        if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+            echo -e "${YELLOW}已取消操作。${PLAIN}"
+            return 0
+        fi
+    fi
+
+    local tmp_dir tmp_cfg
+    tmp_dir=$(mktemp -d)
+    tmp_cfg="${tmp_dir}/config.json"
+    jq '.inbounds = ((.inbounds // []) | map(select(.tag != "hysteria2-in")))' "$CONFIG" > "$tmp_cfg"
+    if ! XRAY_LOCATION_ASSET="$XRAY_ASSET_DIR" "$XRAY_BIN" run -test -c "$tmp_cfg" >/dev/null 2>&1; then
+        rm -rf "$tmp_dir"
+        echo -e "${RED}❌ 移除 Hysteria2 后配置校验失败，已保留原配置！${PLAIN}"
+        return 1
+    fi
+    chmod 644 "$tmp_cfg"
+    mv -f "$tmp_cfg" "$CONFIG"
+    rm -rf "$tmp_dir"
+    rm -f /etc/xray/cert/hy2_self.crt /etc/xray/cert/hy2_self.key
+    restart_xray
+    echo -e "${GREEN}✅ 已关闭并移除 Hysteria2 节点（原有 XHTTP 与分流规则不受影响）！${PLAIN}"
+}
+
+manage_hy2() {
+    local sub="${1:-}"
+    [ $# -gt 0 ] && shift
+    case "$sub" in
+        status|info|show)
+            hy2_show_status
+            ;;
+        enable|on|update|add)
+            hy2_enable "$@"
+            ;;
+        disable|off|remove|del)
+            hy2_disable "$@"
+            ;;
+        "")
+            while true; do
+                echo ""
+                hy2_show_status || true
+                echo ""
+                echo -e "${CYAN}Hysteria2 协议节点管理:${PLAIN}"
+                echo -e "  ${GREEN}1.${PLAIN} 开启 / 修改 Hysteria2 节点 (支持自定义 UDP 端口 / Salamander 混淆 / Brutal)"
+                echo -e "  ${GREEN}2.${PLAIN} 关闭并移除 Hysteria2 节点"
+                echo -e "  ${GREEN}0.${PLAIN} 返回主菜单"
+                local c=""
+                read_tty -p "请选择 [0-2]: " c || return 0
+                c=$(echo "$c" | tr -d ' \t\r\n')
+                case "$c" in
+                    1) hy2_enable || true ;;
+                    2) hy2_disable || true ;;
+                    0|"") return 0 ;;
+                    *) echo -e "${RED}无效选项，请重新输入！${PLAIN}" ;;
+                esac
+            done
+            ;;
+        *)
+            echo "用法:"
+            echo "  xm hy2                        打开 Hysteria2 交互管理菜单"
+            echo "  xm hy2 status                 查看 Hysteria2 状态与分享链接"
+            echo "  xm hy2 enable [选项]          开启/更新 Hysteria2 (--port P --auth PW --obfs OPW --brutal UP/DOWN --yes)"
+            echo "  xm hy2 disable [--yes]        关闭并移除 Hysteria2 节点"
             return 1
             ;;
     esac
@@ -3679,11 +4217,16 @@ menu() {
         echo -e " ${GREEN}16.${PLAIN} 更新 xm 管理脚本到最新版 (update-script)"
         echo -e " ${GREEN}17.${PLAIN} SSH 端口修改与仅密钥登录加固 (ssh)"
         echo -e " ${GREEN}18.${PLAIN} 管理分流路由与 WARP IPv4 出口 (route)"
+        if [ -f "$CONFIG" ] && command -v jq >/dev/null 2>&1 && jq -e '(.inbounds // []) | any(.tag == "hysteria2-in")' "$CONFIG" >/dev/null 2>&1; then
+            echo -e " ${GREEN}19.${PLAIN} 管理 Hysteria2 协议节点 (hy2) ${GREEN}[已开启]${PLAIN}"
+        else
+            echo -e " ${GREEN}19.${PLAIN} 管理 Hysteria2 协议节点 (hy2) ${YELLOW}[未开启]${PLAIN}"
+        fi
         echo -e "--------------------------------------------------"
-        echo -e " ${RED}19.${PLAIN} 彻底卸载清理组件 (uninstall)"
+        echo -e " ${RED}20.${PLAIN} 彻底卸载清理组件 (uninstall)"
         echo -e " ${YELLOW}0.${PLAIN} 退出菜单"
         echo -e "${BLUE}==================================================${PLAIN}"
-        read_tty -p "请输入选项 [0-19]: " choice
+        read_tty -p "请输入选项 [0-20]: " choice
         case "$choice" in
             1) show_info ;;
             2) start_xray ;;
@@ -3709,7 +4252,8 @@ menu() {
             16) update_xm_script 1 ;;
             17) manage_ssh ;;
             18) manage_routes; continue ;;
-            19) uninstall_xray ;;
+            19) manage_hy2; continue ;;
+            20) uninstall_xray ;;
             0) exit 0 ;;
             *) echo -e "${RED}输入无效，请重新输入！${PLAIN}" ;;
         esac
@@ -3749,6 +4293,7 @@ case "${1:-}" in
     bbr) enable_bbr ;;
     ssh|ssh-port) shift; manage_ssh "$@" ;;
     route|routes) shift; manage_routes "$@" ;;
+    hy2|hysteria|hysteria2) shift; manage_hy2 "$@" ;;
     uninstall|del) shift; uninstall_xray "$@" ;;
     *) menu ;;
 esac
