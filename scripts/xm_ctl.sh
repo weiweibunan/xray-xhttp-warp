@@ -357,7 +357,7 @@ show_info() {
     if [ -n "$hy2_uri" ]; then
         hy2_port=$(get_inbound_field "hysteria2-in" "port")
         echo -e "--------------------------------------------------"
-        echo -e "${GREEN}⚡ 附加节点：【Hysteria2 - UDP 加速 (${hy2_port:-443}/udp)】${PLAIN}(抗弱网丢包/共用分流规则)"
+        echo -e "${GREEN}⚡ 附加节点：【Hysteria2 - UDP 加速 (${hy2_port:-18443}/udp)】${PLAIN}(抗弱网丢包/共用分流规则)"
         echo -e "${YELLOW}${hy2_uri}${PLAIN}"
     fi
     echo -e "${BLUE}==================================================${PLAIN}"
@@ -1033,7 +1033,7 @@ hy2_uri_encode() {
 }
 
 hy2_random_secret() {
-    tr -dc 'A-Za-z0-9' < /dev/urandom 2>/dev/null | head -c 16
+    dd if=/dev/urandom bs=1024 count=1 2>/dev/null | tr -dc 'A-Za-z0-9' | cut -c1-16
 }
 
 hy2_check_udp_port_conflict() {
@@ -1054,6 +1054,25 @@ hy2_check_udp_port_conflict() {
         return 1
     fi
     echo "$line"
+    return 0
+}
+
+hy2_pick_default_port() {
+    local h3_port="${1:-}" xc_port="${2:-}" xt_port="${3:-}" socks_port="${4:-}" cur_port="${5:-}"
+    local cand=""
+    for cand in 18443 24443 34443 2087 2096 8444; do
+        [ -n "$xc_port" ] && [ "$cand" = "$xc_port" ] && continue
+        [ -n "$xt_port" ] && [ "$cand" = "$xt_port" ] && continue
+        [ -n "$socks_port" ] && [ "$cand" = "$socks_port" ] && continue
+        if [ "$cand" = "443" ] || [ "$cand" = "8443" ] || [ "$cand" = "8080" ] || [ "$cand" = "40000" ]; then
+            continue
+        fi
+        if ! hy2_check_udp_port_conflict "$cand" "$h3_port" "$cur_port" >/dev/null 2>&1; then
+            echo "$cand"
+            return 0
+        fi
+    done
+    echo "18443"
     return 0
 }
 
@@ -1249,7 +1268,7 @@ hy2_enable() {
         esac
     done
 
-    local cur_hy2_json cur_port cur_auth cur_obfs cur_up cur_down h3_port default_port ip
+    local cur_hy2_json cur_port cur_auth cur_obfs cur_up cur_down h3_port xc_port xt_port socks_port default_port ip
     cur_hy2_json=$(jq -c '(.inbounds // [])[] | select(.tag=="hysteria2-in")' "$CONFIG" 2>/dev/null | head -n1 || true)
     cur_port=$(echo "$cur_hy2_json" | jq -r '.port // empty' 2>/dev/null || true)
     cur_auth=$(echo "$cur_hy2_json" | jq -r '.settings.clients[0].auth // .settings.users[0].auth // empty' 2>/dev/null || true)
@@ -1257,14 +1276,15 @@ hy2_enable() {
     cur_up=$(echo "$cur_hy2_json" | jq -r '.streamSettings.finalmask.quicParams.brutalUp // empty' 2>/dev/null | grep -oE '[0-9]+' | head -n1 || true)
     cur_down=$(echo "$cur_hy2_json" | jq -r '.streamSettings.finalmask.quicParams.brutalDown // empty' 2>/dev/null | grep -oE '[0-9]+' | head -n1 || true)
     h3_port=$(get_inbound_field "xhttp-h3-in" "port")
+    xc_port=$(get_inbound_field "xhttp-cdn-443-in" "port")
+    xt_port=$(get_inbound_field "xhttp-tunnel-in" "port")
+    socks_port=$(get_inbound_field "socks-warp" "port")
     ip=$(fetch_public_ip)
 
     if [ -n "$cur_port" ]; then
         default_port="$cur_port"
-    elif ! hy2_check_udp_port_conflict 443 "$h3_port" "$cur_port" >/dev/null; then
-        default_port="443"
     else
-        default_port="18443"
+        default_port=$(hy2_pick_default_port "$h3_port" "$xc_port" "$xt_port" "$socks_port" "$cur_port")
     fi
 
     local hy2_port="" hy2_auth="" hy2_obfs="" brutal_up="" brutal_down="" conflict=""
@@ -1282,6 +1302,12 @@ hy2_enable() {
         fi
         hy2_port="$default_port"
     else
+        echo -e "${CYAN}📌 当前已有入站端口: XHTTP-TCP=${xc_port:-443}/tcp, XHTTP-H3=${h3_port:-8443}/udp${xt_port:+, Tunnel=${xt_port}/tcp}${PLAIN}"
+        if [ -n "$cur_port" ]; then
+            echo -e "   (当前 Hysteria2 使用 ${GREEN}${cur_port}/udp${PLAIN}，直接回车保持不变)"
+        else
+            echo -e "   (为避免与 443/8443 等已有端口冲突，默认使用独立 UDP 端口 ${GREEN}${default_port}/udp${PLAIN})"
+        fi
         while true; do
             local input_port=""
             read_tty -p "请输入 Hysteria2 UDP 监听端口 [1-65535，默认 ${default_port}，输入 0 取消]: " input_port || return 1
@@ -1299,6 +1325,9 @@ hy2_enable() {
             hy2_port="$input_port"
             break
         done
+    fi
+    if [ "$hy2_port" = "${xc_port:-443}" ] || [ "$hy2_port" = "443" ]; then
+        echo -e "${YELLOW}ℹ️  提示: ${hy2_port}/tcp 已用于 XHTTP 直连，此处仅额外监听 ${hy2_port}/udp（若同时使用 Nginx/Caddy HTTP/3 请改选其他端口）。${PLAIN}"
     fi
 
     if [ -n "$cli_auth" ]; then
