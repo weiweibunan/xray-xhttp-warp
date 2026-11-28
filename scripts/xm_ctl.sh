@@ -3200,7 +3200,22 @@ ssh_show_status() {
     echo -e "${BLUE}==================================================${PLAIN}"
 }
 
+ssh_write_authorized_key() {
+    local target_user="$1" target_home="$2" pubkey="$3"
+    local target_group
+    target_group=$(id -gn "$target_user" 2>/dev/null || echo "$target_user")
+    mkdir -p "${target_home}/.ssh"
+    chmod 700 "${target_home}/.ssh"
+    touch "${target_home}/.ssh/authorized_keys"
+    if ! grep -qxF "$pubkey" "${target_home}/.ssh/authorized_keys" 2>/dev/null; then
+        printf '%s\n' "$pubkey" >> "${target_home}/.ssh/authorized_keys"
+    fi
+    chmod 600 "${target_home}/.ssh/authorized_keys"
+    chown -R "${target_user}:${target_group}" "${target_home}/.ssh" 2>/dev/null || true
+}
+
 ssh_prompt_install_pubkey() {
+    SSH_KEYGEN_CONFIRMED=0
     local target_user="" target_home=""
     if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ] && [ -d "/home/${SUDO_USER}" ]; then
         target_user="$SUDO_USER"
@@ -3219,33 +3234,80 @@ ssh_prompt_install_pubkey() {
 
     echo -e "${YELLOW}⚠️ 未在 /root/.ssh/authorized_keys 或 /home/*/.ssh/authorized_keys 检测到任何有效 SSH 公钥！${PLAIN}"
     echo -e "${RED}若此时直接关闭密码登录，你将彻底无法登录服务器！${PLAIN}"
-    local paste_ans pubkey=""
-    read_tty -p "是否现在为账户 '${target_user}' 粘贴添加一把 SSH 公钥？[y/N]: " paste_ans || return 1
-    if [[ "$paste_ans" != "y" && "$paste_ans" != "Y" ]]; then
-        echo -e "${YELLOW}已取消修改，请先配置 SSH 公钥后再执行 xm ssh。${PLAIN}"
-        return 1
-    fi
-    read_tty -p "请粘贴 SSH 公钥整行内容 (如 ssh-ed25519 AAAA...): " pubkey || return 1
-    pubkey=$(echo "$pubkey" | tr -d '\r\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
-    if [[ ! "$pubkey" =~ (ssh-(rsa|ed25519|dss)|ecdsa-sha2-nistp(256|384|521)|sk-(ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com)[[:space:]]+[A-Za-z0-9+/=]+ ]]; then
-        echo -e "${RED}❌ 公钥格式无效，已中止修改！${PLAIN}"
-        return 1
-    fi
-    if command -v ssh-keygen >/dev/null 2>&1; then
-        if ! printf '%s\n' "$pubkey" | ssh-keygen -l -f - >/dev/null 2>&1; then
-            echo -e "${RED}❌ ssh-keygen 校验证书公钥失败，已中止修改！${PLAIN}"
+    echo ""
+    echo -e "${CYAN}请为账户 '${target_user}' 选择公钥配置方式:${PLAIN}"
+    echo -e "  ${GREEN}1.${PLAIN} 自动生成一对新 Ed25519 密钥（推荐新 VPS：自动写入公钥，并显示私钥供复制到 Termius）"
+    echo -e "  ${GREEN}2.${PLAIN} 手动粘贴一把已有 SSH 公钥（例如从 Termius Keychain 复制）"
+    echo -e "  ${GREEN}0.${PLAIN} 取消修改"
+    local mode_choice="" pubkey=""
+    read_tty -p "请选择 [0-2，默认 1]: " mode_choice || return 1
+    mode_choice=$(echo "$mode_choice" | tr -d ' \t\r\n')
+    [ -z "$mode_choice" ] && mode_choice="1"
+
+    case "$mode_choice" in
+        1)
+            if ! command -v ssh-keygen >/dev/null 2>&1; then
+                echo -e "${RED}❌ 当前系统未检测到 ssh-keygen 命令，请选择 2 手动粘贴已有公钥！${PLAIN}"
+                return 1
+            fi
+            local tmp_keydir tmp_key key_comment priv_pem saved_ans=""
+            tmp_keydir=$(mktemp -d /tmp/xm-keygen.XXXXXX)
+            chmod 700 "$tmp_keydir"
+            tmp_key="${tmp_keydir}/id_ed25519"
+            key_comment="xm-${target_user}@$(hostname -s 2>/dev/null || echo vps)-$(date +%Y%m%d)"
+            if ! ssh-keygen -q -t ed25519 -N "" -C "$key_comment" -f "$tmp_key"; then
+                rm -rf "$tmp_keydir"
+                echo -e "${RED}❌ 生成 Ed25519 密钥对失败！${PLAIN}"
+                return 1
+            fi
+            pubkey=$(tr -d '\r\n' < "${tmp_key}.pub")
+            priv_pem=$(cat "$tmp_key")
+            rm -rf "$tmp_keydir"
+
+            ssh_write_authorized_key "$target_user" "$target_home" "$pubkey"
+            echo -e "${GREEN}✅ 已为 '${target_user}' 生成新 Ed25519 密钥对并写入公钥到 ${target_home}/.ssh/authorized_keys！${PLAIN}"
+            echo -e "${YELLOW}====================================================================${PLAIN}"
+            echo -e "${RED}⚠️ 请立即完整复制下面私钥并保存到 Termius / SSH 客户端（不会再次显示）：${PLAIN}"
+            echo -e "${CYAN}${priv_pem}${PLAIN}"
+            priv_pem=""
+            echo -e "${YELLOW}--------------------------------------------------------------------${PLAIN}"
+            echo -e "  对应公钥 (已写入服务器): ${GREEN}${pubkey}${PLAIN}"
+            echo -e "  Termius 导入方式: Keychain -> Add -> Key -> Paste Private Key (粘入上面完整私钥)"
+            echo -e "${YELLOW}====================================================================${PLAIN}"
+            read_tty -p "请先确认已完整保存上方私钥！输入 y 继续改端口并关闭密码登录（其他键暂保留密码登录并退出）[y/N]: " saved_ans || saved_ans="n"
+            if [[ "$saved_ans" != "y" && "$saved_ans" != "Y" ]]; then
+                echo -e "${YELLOW}已保留当前 SSH 端口与密码登录，刚才生成的公钥已保留在 ${target_home}/.ssh/authorized_keys；保存好私钥后再运行 xm ssh 即可。${PLAIN}"
+                return 1
+            fi
+            SSH_KEYGEN_CONFIRMED=1
+            return 0
+            ;;
+        2)
+            read_tty -p "请粘贴 SSH 公钥整行内容 (如 ssh-ed25519 AAAA...): " pubkey || return 1
+            pubkey=$(echo "$pubkey" | tr -d '\r\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+            if [[ ! "$pubkey" =~ (ssh-(rsa|ed25519|dss)|ecdsa-sha2-nistp(256|384|521)|sk-(ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com)[[:space:]]+[A-Za-z0-9+/=]+ ]]; then
+                echo -e "${RED}❌ 公钥格式无效，已中止修改！${PLAIN}"
+                return 1
+            fi
+            if command -v ssh-keygen >/dev/null 2>&1; then
+                if ! printf '%s\n' "$pubkey" | ssh-keygen -l -f - >/dev/null 2>&1; then
+                    echo -e "${RED}❌ ssh-keygen 校验证书公钥失败，已中止修改！${PLAIN}"
+                    return 1
+                fi
+            fi
+            ssh_write_authorized_key "$target_user" "$target_home" "$pubkey"
+            echo -e "${GREEN}✅ 已写入公钥至 ${target_home}/.ssh/authorized_keys！${PLAIN}"
+            return 0
+            ;;
+        0)
+            echo -e "${YELLOW}已取消修改，未做任何更改。${PLAIN}"
             return 1
-        fi
-    fi
-    local target_group
-    target_group=$(id -gn "$target_user" 2>/dev/null || echo "$target_user")
-    mkdir -p "${target_home}/.ssh"
-    chmod 700 "${target_home}/.ssh"
-    touch "${target_home}/.ssh/authorized_keys"
-    printf '%s\n' "$pubkey" >> "${target_home}/.ssh/authorized_keys"
-    chmod 600 "${target_home}/.ssh/authorized_keys"
-    chown -R "${target_user}:${target_group}" "${target_home}/.ssh" 2>/dev/null || true
-    echo -e "${GREEN}✅ 已写入公钥至 ${target_home}/.ssh/authorized_keys！${PLAIN}"
+            ;;
+        *)
+            echo -e "${RED}❌ 无效选项，已取消修改！${PLAIN}"
+            return 1
+            ;;
+    esac
 }
 
 ssh_print_help() {
@@ -3544,6 +3606,7 @@ manage_ssh() {
     fi
 
     local key_rows
+    SSH_KEYGEN_CONFIRMED=0
     key_rows=$(ssh_collect_authorized_keys || true)
     if [ -z "$key_rows" ]; then
         if [ "$auto_yes" -eq 1 ]; then
@@ -3553,7 +3616,7 @@ manage_ssh() {
         ssh_prompt_install_pubkey || return 1
     fi
 
-    if [ "$auto_yes" -ne 1 ]; then
+    if [ "$auto_yes" -ne 1 ] && [ "$SSH_KEYGEN_CONFIRMED" -ne 1 ]; then
         echo -e "\n${CYAN}即将执行以下 SSH 安全修改：${PLAIN}"
         echo -e "  - 更改 SSH 监听端口为 : ${GREEN}${target_port}/tcp${PLAIN} (自动放行本机防火墙)"
         echo -e "  - 关闭密码登录        : ${GREEN}是（仅允许 SSH 公钥登录）${PLAIN}"
