@@ -205,18 +205,19 @@ format_host_for_url() {
 extract_sni_from_cert() {
     local cert_file="$1"
     [ -f "$cert_file" ] || return 0
-    local san_list first_concrete first_any cn
-    san_list=$(openssl x509 -in "$cert_file" -noout -ext subjectAltName 2>/dev/null | grep -oE '(DNS:[^, \r\n]+|IP Address:[^, \r\n]+)' | sed -E 's/^(DNS:|IP Address:)//' || true)
-    if [ -z "$san_list" ]; then
-        san_list=$(openssl x509 -in "$cert_file" -noout -text 2>/dev/null | awk '/Subject Alternative Name/{getline; print}' | grep -oE '(DNS:[^, \r\n]+|IP Address:[^, \r\n]+)' | sed -E 's/^(DNS:|IP Address:)//' || true)
+    local san_raw san_list first_concrete first_any cn
+    san_raw=$(openssl x509 -in "$cert_file" -noout -ext subjectAltName 2>/dev/null || true)
+    if ! printf '%s\n' "$san_raw" | grep -qE 'DNS:|IP Address:'; then
+        san_raw=$(openssl x509 -in "$cert_file" -noout -text 2>/dev/null | awk '/Subject Alternative Name/{getline; print}' || true)
     fi
-    first_concrete=$(echo "$san_list" | grep -v '^\*\.' | head -n1 || true)
-    first_any=$(echo "$san_list" | head -n1 || true)
+    san_list=$(printf '%s\n' "$san_raw" | tr -d '\r' | grep -oE '(DNS:[^,[:space:]]+|IP Address:[^,[:space:]]+)' | sed -E 's/^(DNS:|IP Address:)//' || true)
+    first_concrete=$(printf '%s\n' "$san_list" | grep -v '^\*\.' | head -n1 || true)
+    first_any=$(printf '%s\n' "$san_list" | head -n1 || true)
     if [ -n "$first_concrete" ]; then
         echo "$first_concrete"
         return 0
     fi
-    cn=$(openssl x509 -in "$cert_file" -noout -subject 2>/dev/null | sed -n 's/.*CN[[:space:]]*=[[:space:]]*//p' | cut -d',' -f1 | tr -d ' \r\n' || true)
+    cn=$(openssl x509 -in "$cert_file" -noout -subject 2>/dev/null | sed -n 's/.*CN[[:space:]]*=[[:space:]]*//p' | sed -E 's#[,/].*$##' | tr -d ' \r\n' || true)
     if [ -n "$cn" ] && [[ "$cn" != \*.* ]]; then
         echo "$cn"
         return 0
@@ -1192,9 +1193,9 @@ hy2_build_share_uri() {
     local auth_enc
     auth_enc=$(hy2_uri_encode "$auth")
     if [ -n "$qs" ]; then
-        echo "hysteria2://${auth_enc}@${host_addr}:${port}/?${qs}#Hysteria2-${port}"
+        echo "hysteria2://${auth_enc}@${host_addr}:${port}?${qs}#Hysteria2-${port}"
     else
-        echo "hysteria2://${auth_enc}@${host_addr}:${port}/#Hysteria2-${port}"
+        echo "hysteria2://${auth_enc}@${host_addr}:${port}#Hysteria2-${port}"
     fi
 }
 
